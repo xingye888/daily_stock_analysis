@@ -50,6 +50,12 @@ Content-Type: application/json
 
 Grok Bot Skill 正文见 [`docs/examples/grok_bot/SKILL.md`](examples/grok_bot/SKILL.md)，也可复用 [openclaw Skill](openclaw-skill-integration.md) 示例。环境变量统一为 `DSA_BASE_URL`。
 
+## 学习简报文件
+
+A 股全市场学习简报是独立命令 `python -m src.learning_brief`，说明见 [A股学习简报](cn-learning-brief.md)。它不调用本页的大盘复盘 API，不创建第二个定时任务，也不走通知渠道。
+
+已经安排在工作日 16:30（北京时间）发送简报的 Grok Bot，应读取持续运行目录里的 `latest.md`。文件缺失或日期不是当次生成时间时，只说明没有新简报，不另外补写数字。
+
 ## Skill：大盘复盘
 
 `POST {DSA_BASE_URL}/api/v1/analysis/market-review` 固定返回 202 接受体 + `task_id`，不是复盘正文。请求体可传 `send_notification`、`region`。

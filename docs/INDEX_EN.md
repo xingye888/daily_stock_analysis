@@ -29,6 +29,7 @@ This is the entry point for project documentation. The README covers the project
 | [Data-source stability diagrams](data-source-stability.md) <sub><sub>![P2 Badge](https://img.shields.io/badge/P2-yellow?style=flat)</sub></sub> (Chinese-only) | Existing-source routing, fallback chains, and recommended configuration profiles |
 | [Data Center](data-center-diagnostics.md) (Chinese-only) | Read-only provider capabilities, exact dataset/market support, quality states, and runtime priorities |
 | [Market Support And Boundaries](market-support.md) (Chinese-only) | Market coverage, suffix rules, degraded capabilities, and explicit non-goals for A/H/US/JP/KR/TW stocks |
+| [A-share learning brief](cn-learning-brief.md) (Chinese-only) | Keyless full-market learning brief: facts, explanations, unknowns, coverage gaps, and how the existing 16:30 reader uses the file |
 | [Changelog](CHANGELOG.md) | Release notes, capability changes, and migration notes |
 
 ## Configuration
