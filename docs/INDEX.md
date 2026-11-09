@@ -28,6 +28,7 @@
 | [数据源稳定性与故障处理图示](data-source-stability.md) | Tushare、TickFlow、AkShare、Efinance、YFinance、Longbridge 等已接入源的使用场景、fallback 链路和推荐配置 |
 | [数据中心](data-center-diagnostics.md) | 只读 Provider 能力、数据集质量、精确市场支持与运行时优先级 |
 | [市场支持与边界](market-support.md) | A股/港股/美股/日股/韩股/台股的可用数据、suffix 规则、降级边界与不承诺项 |
+| [A股学习简报](cn-learning-brief.md) | 免密钥全市场学习简报的事实、解释、未知、覆盖缺口和读取方式 |
 | [更新日志](CHANGELOG.md) | 版本变化、能力调整和迁移说明 |
 
 ## 配置

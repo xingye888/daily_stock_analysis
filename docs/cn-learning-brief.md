@@ -1,0 +1,111 @@
+# A股全市场学习简报
+
+本命令整理 A 股全市场学习材料。它记录行情、融资原值、ETF 份额原值和已经打开正文的原始公告，并把事实、解释、未知分开。它不写个股买卖建议，不调用 LLM，不发送通知，不连接券商。
+
+英文索引只保留入口，正文以本中文说明为准。
+
+## 运行
+
+```bash
+python -m src.learning_brief
+```
+
+默认输出到运行目录下的 `reports/cn_learning_brief/`。可用环境变量或参数改目录：
+
+```bash
+CN_LEARNING_BRIEF_OUTPUT_DIR=reports/cn_learning_brief python -m src.learning_brief
+python -m src.learning_brief --output-dir reports/cn_learning_brief
+```
+
+运行器只使用 Python 标准库。它不读取 `.env` 里的密钥；即使环境里已有 LLM 或通知变量，命令也不会使用变量值。
+
+产物：
+
+| 文件 | 内容 |
+| --- | --- |
+| `YYYY-MM-DD.md` | 按生成日期保存的简报 |
+| `latest.md` | 同一份短简报的稳定路径 |
+| `latest.evidence.md` | 原值、单位语句和公告链接 |
+| `latest.coverage.json` | 覆盖矩阵 |
+| `hot_concepts_state.json` | 仅在本次成功取到概念榜时更新，供下一次比较名称 |
+
+`reports/` 已在 `.gitignore` 中，样报不会进入 Git。
+
+退出码：`0` 表示写出了带指数行情的文件，标准输出里的 `complete=false` 仍表示它不是完整简报；`2` 表示指数行情没有取到，`latest.md` 会被写成失败说明，不保留上一份里的数字；`1` 表示目录无法写入。模型综述没有密钥时保持未知。
+
+## 与上游大盘复盘的边界
+
+`python main.py --market-review` 会走 `MarketAnalyzer.generate_market_review()`，需要可用的 LLM 后端，并在未加 `--no-notify` 时进入通知发送。学习简报不调用这条链路。
+
+没有 LLM API 密钥时，模型综述写成未知。Google AI Pro 订阅不能代替 API 密钥。解释只说明字段含义，不把缺少单位的原值换算成亿元。
+
+## 数据口径
+
+| 材料 | 来源 | 写入位置 |
+| --- | --- | --- |
+| 深交所股票成交金额、ETF 成交金额、融资余额 | 深交所 `ShowReport` xlsx，表头含 `(元)` | 表头同时写出指标和“(元)”时，按原值除以 100000000 读成亿元。深市 ETF 这一行是成交金额，不是份额变化 |
+| 上交所股票成交金额 | `COMMON_SSE_SJ_GPSJ_CJGK_MRGK_C` 产品代码 17 的 `TRADE_AMT`，以及 `search_stockData_2021.js` | 脚本把该字段写入“成交金额(亿元)”时，数字本身就是亿元，不再除以 1 亿。脚本缺少这句时不换算 |
+| 上交所融资余额 | `commonSoaQuery.do` 的 `RZRQ_HZ_INFO` 字段 `rzye`，以及 `search_otherData_2021.js` | 脚本表头为“融资余额(元)”时，原值除以 100000000。缺少表头时不换算 |
+| 指数点位和新浪成交额字段 | 新浪行情 | 响应没有单位文字时保留原值 |
+| 涨跌家数 | 东方财富 `getTopicZDFenBu` | 事实为分布桶相加；它不是涨跌停家数 |
+| 涨停、跌停家数 | 东方财富涨停池、跌停池字段 `tc` | 事实只写家数和行业出现次数，不写证券代码 |
+| 行业、概念涨跌幅 | 东方财富板块列表；失败时用新浪 `newFLJK.php` | 事实为涨跌幅字段。热点持续性只有上一交易日同一来源的名单时才比较 |
+| 热点持续性 | 本目录上一份 `hot_concepts_state.json` 的名称 | 只在本次成功取到概念榜后比较。没有上一交易日名单时保持未知 |
+| 上交所融资余额 | `queryMargin.do` 字段 `rzye`，以及汇总页 HTML | 只有页面语句同时写明“融资余额”和单位时才采用该单位。否则原值不换算 |
+| 深交所融资余额 | 优先读 `1837_xxpl` xlsx 表头；失败时才读 JSON 字段 `jrrzye` | xlsx 表头含“融资余额(元)”时才换算。JSON 页脚公式里的单位不套到单元格 |
+| 融资对照 | 东方财富 `FIN_BALANCE` 与页面 HTML | 页面没有同时写明该字段和单位时不换算。日期不同的数字不相加 |
+| ETF 份额 | 上交所 `TOT_VOL` | 只写原值合计和两日差额。差额不是金额 |
+| 基本面 | 中国人民银行沟通交流索引中的公告、政策、贷款或报告，并打开正文 | 事实摘录已打开的正文。没有正文的标题不进入基本面 |
+
+主力资金流不采集。深市 ETF 份额、带货币单位的申购或赎回数据、交易所官方全市场股票成交额，取不到就留在未知。
+
+生成日、行情日期和融资或份额的统计日期分开写。周末、开盘前、交易时段，以及行情日期不是生成日期时，状态都是「不是完整简报」。指数行情失败时，`latest.md` 改写为失败说明，不保留上一份文件中的数字。`hot_concepts_state.json` 只保存名称，不回填行情。
+
+## 已有 16:30 任务如何读取
+
+工作日 16:30（北京时间）的发送任务已经由 Grok Bot 安排在当前对话中。本仓库不新增 `schedule`、GitHub Actions 定时任务或通知渠道。
+
+已有的 16:30 任务不改时间、不改渠道。它应在同一次运行里先执行 `python -m src.learning_brief`，再读取刚刚写出的 `latest.md`。
+
+1. 核对生成时间属于当次运行。
+2. 转述事实、解释和未知。单位只转述文件里已经引用的原文。
+3. 文件写明「不是完整简报」或「本次没有形成简报」时，消息只说明这个状态，不用上一份文件或模型补数字。
+
+临时开发环境里的文件会随环境消失，不能当作持续运行产物。
+
+## 私有运行包
+
+给 Grok Bot 本机使用的压缩包只包含 `src/learning_brief`、对应测试和一份 README。包内没有密钥，也没有个人财务资料。解压后在包目录执行：
+
+```bash
+python3 -m unittest tests.test_cn_learning_brief
+python3 -m src.learning_brief --output-dir /workspace/ashare-briefs
+```
+
+`/workspace/ashare-briefs/` 是私有输出目录。不要把这个目录提交到公开 Fork。仓库已忽略 `ashare-briefs/`。现有 16:30 例行不在本次修改范围内；若要让它阅读简报，只能让它读取这个私有目录里的 `latest.md`。
+
+## 最简持久运行
+
+本次没有安装，也没有扩大权限。优先不依赖使用者的电脑每天开机，同时不新增定时任务。
+
+可行方案是：已有的工作日 16:30（北京时间）Grok Bot 任务，在它自己的执行环境里完成本次采集并读取 `latest.md`。这样不需要使用者的电脑开机，也不新增 cron 或 Actions。命令只使用 Python 标准库，访问新浪、东方财富、上交所、深交所和中国人民银行的公开页面。
+
+2026-11-09 在当前云端任务里实测：`python -m src.learning_brief` 可以运行，并能访问新浪、东方财富、上交所、深交所和中国人民银行。输出写在该任务自己的磁盘上。仓库工作流和本机可见的 Bot 目录里，都没有一条已经指向 `latest.md` 的 16:30 读取配置。因此还不能说现有例行读得到这份文件。
+
+必须先确认：
+
+1. 16:30 任务的执行环境能否运行 `python -m src.learning_brief`。
+2. 该环境能否访问上面五个网站。
+3. 工作目录是否只在当次任务内存活。若是，必须在同一次任务里生成并阅读，不能依赖前一天留下的 `latest.md`。
+4. 读到「不是完整简报」或「本次没有形成简报」时，只转述状态。
+5. 输出不提交到公开 Fork，环境里不写入密钥或个人财务资料。
+
+若这五项不能确认，就不存在一条已经核实、且同时满足“不依赖用户电脑、不启用定时 Actions、不付费”的运行路径。
+
+备选是公开仓库的 GitHub Actions 定时任务。公共仓库的标准 runner 使用 GitHub 包含的免费额度，也不需要电脑开机。本阶段不添加、不启用这条工作流。以后若要启用，需要单独确认：允许打开定时 Actions、产物放在何处、Bot 如何读取，以及简报不另走通知渠道。
+
+不采用依赖电脑每天开机的本机 cron。不购买云主机，也不为模型充值。
+
+## 回滚
+
+删除 `src/learning_brief/`、`tests/test_cn_learning_brief.py` 和本说明，并去掉 `docs/CHANGELOG.md`、`docs/INDEX.md`、`docs/INDEX_EN.md`、`docs/grok-bot-integration.md`、`.env.example` 中对应的入口即可。已写出的 `reports/cn_learning_brief/` 只是本地产物。
