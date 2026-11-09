@@ -44,7 +44,9 @@ python -m src.learning_brief --output-dir reports/cn_learning_brief
 | 材料 | 来源 | 写入位置 |
 | --- | --- | --- |
 | 深交所股票成交金额、ETF 成交金额、融资余额 | 深交所 `ShowReport` xlsx，表头含 `(元)` | 表头同时写出指标和“(元)”时，按原值除以 100000000 读成亿元。深市 ETF 这一行是成交金额，不是份额变化 |
-| 指数点位和新浪成交额字段、上交所 `TRADE_AMT` | 新浪行情、上交所 `COMMON_SSE_SJ_GPSJ_CJGK_MRGK_C` | 响应没有单位文字时保留原值，不换算，也不用字段比值猜测单位 |
+| 上交所股票成交金额 | `COMMON_SSE_SJ_GPSJ_CJGK_MRGK_C` 产品代码 17 的 `TRADE_AMT`，以及 `search_stockData_2021.js` | 脚本把该字段写入“成交金额(亿元)”时，数字本身就是亿元，不再除以 1 亿。脚本缺少这句时不换算 |
+| 上交所融资余额 | `commonSoaQuery.do` 的 `RZRQ_HZ_INFO` 字段 `rzye`，以及 `search_otherData_2021.js` | 脚本表头为“融资余额(元)”时，原值除以 100000000。缺少表头时不换算 |
+| 指数点位和新浪成交额字段 | 新浪行情 | 响应没有单位文字时保留原值 |
 | 涨跌家数 | 东方财富 `getTopicZDFenBu` | 事实为分布桶相加；它不是涨跌停家数 |
 | 涨停、跌停家数 | 东方财富涨停池、跌停池字段 `tc` | 事实只写家数和行业出现次数，不写证券代码 |
 | 行业、概念涨跌幅 | 东方财富板块列表；失败时用新浪 `newFLJK.php` | 事实为涨跌幅字段。热点持续性只有上一交易日同一来源的名单时才比较 |
@@ -70,6 +72,17 @@ python -m src.learning_brief --output-dir reports/cn_learning_brief
 3. 文件写明「不是完整简报」或「本次没有形成简报」时，消息只说明这个状态，不用上一份文件或模型补数字。
 
 临时开发环境里的文件会随环境消失，不能当作持续运行产物。
+
+## 私有运行包
+
+给 Grok Bot 本机使用的压缩包只包含 `src/learning_brief`、对应测试和一份 README。包内没有密钥，也没有个人财务资料。解压后在包目录执行：
+
+```bash
+python3 -m unittest tests.test_cn_learning_brief
+python3 -m src.learning_brief --output-dir /workspace/ashare-briefs
+```
+
+`/workspace/ashare-briefs/` 是私有输出目录。不要把这个目录提交到公开 Fork。仓库已忽略 `ashare-briefs/`。现有 16:30 例行不在本次修改范围内；若要让它阅读简报，只能让它读取这个私有目录里的 `latest.md`。
 
 ## 最简持久运行
 

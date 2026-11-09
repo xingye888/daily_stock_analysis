@@ -19,6 +19,9 @@ from src.learning_brief.brief import (
     classify_headline,
     collect_market,
     concept_for_date,
+    concept_persistence,
+    sse_margin_unit_from_script,
+    sse_turnover_unit_from_script,
     extract_unit_phrases,
     extract_zoom_text,
     market_clock,
@@ -366,6 +369,30 @@ class LearningBriefRenderTests(unittest.TestCase):
         self.assertIn("不是完整简报", text)
         self.assertFalse(limit_pool_date_ok("20261109", "20261106"))
         self.assertTrue(limit_pool_date_ok("20261106", "20261106"))
+        script = (
+            'sqlId: "COMMON_SSE_SJ_GPSJ_CJGK_MRGK_C" indexOf("17") '
+            "v.TRADE_AMT.str_toFixed(2)); //成交金额(亿元)"
+        )
+        self.assertEqual(sse_turnover_unit_from_script(script), "成交金额(亿元)")
+        self.assertEqual(sse_turnover_unit_from_script("TRADE_AMT"), "")
+        margin = 'sqlId: "RZRQ_HZ_INFO" formatNum(v.rzye) 融资余额(元)'
+        self.assertEqual(sse_margin_unit_from_script(margin), "融资余额(元)")
+        self.assertEqual(sse_margin_unit_from_script("rzye"), "")
+        saved = concept_persistence(
+            {"source": "新浪板块", "concept_date": "2026-11-05", "names": ["生物育种", "其他"]},
+            ["生物育种", "钙钛矿"],
+            "2026-11-06",
+            "新浪板块",
+        )
+        self.assertEqual(saved["status"], "compared")
+        self.assertEqual(saved["overlap"], ["生物育种"])
+        other = concept_persistence(
+            {"source": "东方财富板块", "concept_date": "2026-11-05", "names": ["生物育种"]},
+            ["生物育种"],
+            "2026-11-06",
+            "新浪板块",
+        )
+        self.assertEqual(other["status"], "different_source")
 
 
 if __name__ == "__main__":

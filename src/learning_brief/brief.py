@@ -59,6 +59,9 @@ SINA_BOARD_URLS = {
 }
 SZSE_XLSX_URL = "https://www.szse.cn/api/report/ShowReport"
 SSE_DEAL_URL = "https://query.sse.com.cn/commonQuery.do"
+SSE_MARGIN_SOA_URL = "https://query.sse.com.cn/commonSoaQuery.do"
+SSE_OVERVIEW_JS = "https://www.sse.com.cn/xhtml/home/2021public/querySearch/search_stockData_2021.js"
+SSE_MARGIN_JS = "https://www.sse.com.cn/xhtml/home/2021public/querySearch/search_otherData_2021.js"
 FENBU_URL = (
     "https://push2ex.eastmoney.com/getTopicZDFenBu"
     "?ut=7eea3edcaed734bea9cbfc24409ed989&dpt=wz.ztzt"
@@ -594,6 +597,26 @@ def parse_sse_stock_trade_amt(payload: Mapping[str, Any]) -> dict[str, str] | No
     return None
 
 
+def sse_turnover_unit_from_script(script: str) -> str:
+    """Official daily-overview script labels product 17 TRADE_AMT as 亿元."""
+    if "COMMON_SSE_SJ_GPSJ_CJGK_MRGK_C" not in script:
+        return ""
+    if 'indexOf("17")' not in script:
+        return ""
+    if "v.TRADE_AMT" not in script or "成交金额(亿元)" not in script:
+        return ""
+    return "成交金额(亿元)"
+
+
+def sse_margin_unit_from_script(script: str) -> str:
+    """Official margin summary script prints rzye under 融资余额(元)."""
+    if "RZRQ_HZ_INFO" not in script:
+        return ""
+    if "v.rzye" not in script or "融资余额(元)" not in script:
+        return ""
+    return "融资余额(元)"
+
+
 def market_clock(generated: datetime, quote_date: str) -> dict[str, Any]:
     current = beijing_now(generated)
     minutes = current.hour * 60 + current.minute
@@ -689,16 +712,25 @@ def concept_persistence(
     previous: Mapping[str, Any] | None,
     names: list[str],
     session_date: str,
+    source: str = "",
 ) -> dict[str, Any]:
     if not names:
-        return {"status": "missing", "overlap": [], "previous_date": ""}
+        return {"status": "missing", "overlap": [], "previous_date": "", "source": source}
     if not previous or not previous.get("names"):
-        return {"status": "unknown", "overlap": [], "previous_date": ""}
+        return {"status": "unknown", "overlap": [], "previous_date": "", "source": source}
+    previous_source = str(previous.get("source") or "")
+    if not previous_source or previous_source != source:
+        return {
+            "status": "different_source",
+            "overlap": [],
+            "previous_date": str(previous.get("concept_date") or ""),
+            "source": source,
+        }
     previous_date = str(previous.get("concept_date") or "")
     overlap = [name for name in names if name in set(previous.get("names") or [])]
     if previous_date == session_date:
-        return {"status": "same_session", "overlap": overlap, "previous_date": previous_date}
-    return {"status": "compared", "overlap": overlap, "previous_date": previous_date}
+        return {"status": "same_session", "overlap": overlap, "previous_date": previous_date, "source": source}
+    return {"status": "compared", "overlap": overlap, "previous_date": previous_date, "source": source}
 
 
 def _safe_call(label: str, func: Callable[[], Any], errors: list[dict[str, str]]) -> Any:
@@ -739,8 +771,8 @@ def _fetch_sina_board(http_get: HttpGet, board_type: str) -> dict[str, Any]:
     url = SINA_BOARD_URLS[board_type]
     text = http_get(url, _headers("http://finance.sina.com.cn/stock/sl/"), 20).decode("gb18030", "replace")
     rows = parse_sina_board(text)
-    if not rows:
-        return {"status": "missing", "error": "sina board empty", "top": [], "bottom": []}
+    if not rows or not _board_has_movement(rows):
+        return {"status": "missing", "error": "新浪板块涨跌幅为空或全为 0，不作为收盘榜", "top": [], "bottom": []}
     top, bottom = _rank_board(rows)
     return {
         "status": "ok",
@@ -851,15 +883,21 @@ def _fetch_szse_margin_xlsx(http_get: HttpGet, session_date: str) -> dict[str, A
 
 
 def _fetch_sse_trade_amt(http_get: HttpGet, session_date: str) -> dict[str, str] | None:
-    day = session_date or beijing_now().strftime("%Y-%m-%d")
-    params = {
-        "sqlId": "COMMON_SSE_SJ_GPSJ_CJGK_MRGK_C",
-        "PRODUCT_CODE": "01,02,03,11,17",
-        "type": "inParams",
-        "SEARCH_DATE": day,
-    }
-    url = SSE_DEAL_URL + "?" + urllib.parse.urlencode(params)
-    return parse_sse_stock_trade_amt(_get_json(http_get, url, _headers("https://www.sse.com.cn/")))
+    start = datetime.strptime(session_date, "%Y-%m-%d") if session_date else beijing_now()
+    for offset in range(0, 8):
+        day = (start - timedelta(days=offset)).strftime("%Y-%m-%d")
+        params = {
+            "sqlId": "COMMON_SSE_SJ_GPSJ_CJGK_MRGK_C",
+            "PRODUCT_CODE": "01,02,03,11,17",
+            "type": "inParams",
+            "SEARCH_DATE": day,
+        }
+        url = SSE_DEAL_URL + "?" + urllib.parse.urlencode(params)
+        parsed = parse_sse_stock_trade_amt(_get_json(http_get, url, _headers("https://www.sse.com.cn/")))
+        if parsed and parsed.get("trade_amt") not in (None, "", "0", "0.0"):
+            parsed["searched_date"] = day
+            return parsed
+    return None
 
 
 def _fetch_pool(http_get: HttpGet, url: str, session_date: str) -> dict[str, Any]:
@@ -888,18 +926,19 @@ def _fetch_sse_margin(http_get: HttpGet) -> dict[str, Any] | None:
     start = (beijing_now() - timedelta(days=20)).strftime("%Y%m%d")
     params = {
         "isPagination": "true",
-        "beginDate": start,
-        "endDate": today,
-        "tabType": "",
-        "stockCode": "",
-        "pageHelp.pageSize": "30",
+        "pageHelp.pageSize": "25",
         "pageHelp.pageNo": "1",
         "pageHelp.beginPage": "1",
         "pageHelp.cacheSize": "1",
-        "pageHelp.endPage": "5",
+        "pageHelp.endPage": "1",
+        "stockCode": "",
+        "beginDate": start,
+        "endDate": today,
+        "sqlId": "RZRQ_HZ_INFO",
     }
-    url = SSE_MARGIN_URL + "?" + urllib.parse.urlencode(params)
-    return parse_sse_margin(_get_json(http_get, url, _headers("https://www.sse.com.cn/")))
+    url = SSE_MARGIN_SOA_URL + "?" + urllib.parse.urlencode(params)
+    parsed = parse_sse_margin(_get_json(http_get, url, _headers("https://www.sse.com.cn/market/othersdata/margin/sum/")))
+    return parsed
 
 
 def _fetch_szse_margin(http_get: HttpGet, session_date: str) -> dict[str, Any] | None:
@@ -1031,23 +1070,40 @@ def collect_market(
     indices = _safe_call("新浪指数行情", lambda: _fetch_indices(getter), errors) or []
     session_dates = sorted({row["quote_date"] for row in indices if row.get("quote_date")})
     session_date = session_dates[-1] if session_dates else ""
+    clock = market_clock(current, session_date)
+    after_close = clock.get("phase") == "收盘后" and clock.get("quote_is_generation_date")
 
-    breadth = _safe_call(
-        "东方财富涨跌分布",
-        lambda: _get_json(getter, FENBU_URL, _headers("https://quote.eastmoney.com/")),
-        errors,
-    )
+    breadth = None
+    limit_up = None
+    limit_down = None
+    deferred = {
+        "status": "deferred",
+        "reason": "未到收盘，或行情日不是生成日。涨跌家数和涨跌停留到收盘后再运行，不采用盘中或开盘前的零值。",
+    }
     breadth_parsed = None
-    if isinstance(breadth, dict):
-        data = breadth.get("data") or {}
-        if data.get("fenbu"):
-            counted = summarize_fenbu(data.get("fenbu") or [])
-            if counted["total"] > 0:
-                breadth_parsed = {"status": "ok", "qdate": str(data.get("qdate") or ""), **counted}
-            else:
-                errors.append({"source": "东方财富涨跌分布", "error": "分布合计为 0，不作为有效涨跌家数"})
-    limit_up = _safe_call("东方财富涨停池", lambda: _fetch_pool(getter, ZT_URL, session_date), errors)
-    limit_down = _safe_call("东方财富跌停池", lambda: _fetch_pool(getter, DT_URL, session_date), errors)
+    if after_close:
+        breadth = _safe_call(
+            "东方财富涨跌分布",
+            lambda: _get_json(getter, FENBU_URL, _headers("https://quote.eastmoney.com/")),
+            errors,
+        )
+        if isinstance(breadth, dict):
+            data = breadth.get("data") or {}
+            if data.get("fenbu"):
+                counted = summarize_fenbu(data.get("fenbu") or [])
+                qdate = str(data.get("qdate") or "")
+                if counted["total"] > 0 and limit_pool_date_ok(qdate, session_date.replace("-", "")):
+                    breadth_parsed = {"status": "ok", "qdate": qdate, **counted}
+                elif counted["total"] == 0:
+                    errors.append({"source": "东方财富涨跌分布", "error": "分布合计为 0，不作为有效涨跌家数"})
+                else:
+                    errors.append({"source": "东方财富涨跌分布", "error": f"返回日期 {qdate} 与行情日不一致"})
+        limit_up = _safe_call("东方财富涨停池", lambda: _fetch_pool(getter, ZT_URL, session_date), errors)
+        limit_down = _safe_call("东方财富跌停池", lambda: _fetch_pool(getter, DT_URL, session_date), errors)
+    else:
+        breadth_parsed = deferred
+        limit_up = deferred
+        limit_down = deferred
     industries = _safe_call("东方财富行业板块", lambda: _fetch_board(getter, "2"), errors) or {
         "status": "missing",
         "top": [],
@@ -1064,6 +1120,20 @@ def collect_market(
         szse_margin = _safe_call("深交所融资融券汇总", lambda: _fetch_szse_margin(getter, session_date), errors)
     szse_amounts = _safe_call("深交所证券类别统计", lambda: _fetch_szse_labeled_amounts(getter, session_date), errors) or {}
     sse_trade_amt = _safe_call("上交所股票成交概况", lambda: _fetch_sse_trade_amt(getter, session_date), errors)
+    overview_script = _safe_call(
+        "上交所每日概况脚本",
+        lambda: getter(SSE_OVERVIEW_JS, _headers("https://www.sse.com.cn/market/stockdata/overview/day/"), 20).decode("utf-8", "replace"),
+        errors,
+    ) or ""
+    margin_script = _safe_call(
+        "上交所融资融券脚本",
+        lambda: getter(SSE_MARGIN_JS, _headers("https://www.sse.com.cn/market/othersdata/margin/sum/"), 20).decode("utf-8", "replace"),
+        errors,
+    ) or ""
+    if sse_trade_amt:
+        sse_trade_amt = {**sse_trade_amt, "unit_label": sse_turnover_unit_from_script(overview_script)}
+    if sse_margin:
+        sse_margin = {**sse_margin, "unit_label": sse_margin_unit_from_script(margin_script)}
     em_margin = _safe_call("东方财富融资融券汇总", lambda: _fetch_em_margin(getter), errors)
     etf = _safe_call("上交所ETF份额", lambda: _fetch_etf_pair(getter, session_date), errors) or {
         "status": "missing",
@@ -1096,7 +1166,7 @@ def collect_market(
     payload = {
         "generated_at": format_stamp(current),
         "session_date": session_date,
-        "clock": market_clock(current, session_date),
+        "clock": clock,
         "cache_used": False,
         "llm_called": False,
         "notifications_sent": False,
@@ -1108,7 +1178,12 @@ def collect_market(
         "limit_down": limit_down or {"status": "missing", "count": None},
         "industries": industries,
         "concepts": concepts,
-        "persistence": concept_persistence(previous_state, concept_names, session_date),
+        "persistence": concept_persistence(
+            previous_state,
+            concept_names,
+            session_date,
+            str((concepts or {}).get("source") or ""),
+        ),
         "sse_margin": sse_margin,
         "szse_margin": szse_margin,
         "em_margin": em_margin,
@@ -1224,7 +1299,7 @@ def render_brief(payload: Mapping[str, Any]) -> str:
     lines.extend(["", "## 2. 解释", ""])
     lines.extend(
         [
-            "表头同时写出指标和“(元)”的交易所数字，按原值除以 100000000 读成亿元。没有单位原文的字段保持原值。",
+            "表头写“(元)”时，原值除以 100000000 读成亿元。表头写“(亿元)”时，数字本身就是亿元，不再除以 1 亿。没有表头的字段保持原值。",
             "融资余额按各自日期并列。日期不同的数字不相加。",
             "涨跌家数是分布桶里的计数相加。涨停和跌停以专题池的 tc 为准。",
             "行业和概念涨跌幅是价格变动。它们不说明业绩或政策。",
@@ -1240,7 +1315,7 @@ def render_brief(payload: Mapping[str, Any]) -> str:
         lines.append(f"- 上交所ETF份额字段：{item}")
     lines.extend(
         [
-            "- 没有单位原文的成交额和融资余额不换算。上交所 TRADE_AMT 与新浪成交额字段属于这类。",
+            "- 没有表头原文的字段不换算。新浪指数成交额字段属于这类。",
             "- 深市 ETF 份额，以及申购或赎回的货币金额，本次没有取得。深交所 ETF 行只表示成交金额。",
             "- 主力资金流没有采集。",
             "- 热点是否持续：没有同口径多日样本时保持未知。",
@@ -1291,17 +1366,32 @@ def _render_price_facts(data: Mapping[str, Any]) -> list[str]:
     else:
         lines.append("深交所带表头的股票成交金额本次没有取到。")
     sse_amt = data.get("sse_trade_amt") or {}
-    if sse_amt.get("trade_amt"):
+    if sse_amt.get("trade_amt") and sse_amt.get("unit_label") == "成交金额(亿元)":
+        lines.append(
+            f"上交所股票成交金额：日期 {sse_amt.get('date')}，产品代码 17，字段 TRADE_AMT={sse_amt['trade_amt']}。"
+            "每日概况脚本把该字段写入表头“成交金额(亿元)”。按该表头，这个数字的单位是亿元。"
+        )
+    elif sse_amt.get("trade_amt"):
         lines.append(
             f"上交所股票成交概况：日期 {sse_amt.get('date')}，产品代码 17，字段 TRADE_AMT={sse_amt['trade_amt']}。"
-            "该 JSON 没有单位，不换算。"
+            "没有取到配套的表头原文，不换算。"
         )
     indices = [row for row in data.get("indices") or [] if row.get("code") in TURNOVER_CODES]
     if not indices:
         lines.append("上证指数和深证成指本次没有取到。")
         lines.append("")
         return lines
+    pre_close = (data.get("clock") or {}).get("phase") != "收盘后"
+    if pre_close:
+        lines.append("当前不是收盘后。下面的指数快照不是收盘定稿；点位或成交额为 0 时，不计算涨跌幅。请于收盘后再运行。")
     for row in indices:
+        if pre_close and (float(row.get("current") or 0) == 0 or float(row.get("amount_field") or 0) == 0):
+            lines.append(
+                f"{row['name']} 行情时间 {row.get('quote_date')} {row.get('quote_time')}，"
+                f"点位原值 {row.get('current')}，成交额字段原值 {int(round(float(row.get('amount_field') or 0)))}。"
+                "这是盘前或盘中空值，不换算，也不当成跌停。"
+            )
+            continue
         lines.append(
             f"{row['name']} { _decimal(row['current'], 2) } 点，涨跌 {_signed(row['change'], 2)} 点，"
             f"涨跌幅 {_signed(row['change_pct'], 2)}%。行情时间 {row.get('quote_date')} {row.get('quote_time')}。"
@@ -1317,13 +1407,15 @@ def _render_price_facts(data: Mapping[str, Any]) -> list[str]:
 def _render_margin_facts(data: Mapping[str, Any]) -> list[str]:
     lines = []
     sse = data.get("sse_margin")
-    if sse:
-        phrase = unit_phrase_for(data.get("sse_unit_phrases") or [], "融资余额")
+    if sse and sse.get("unit_label") == "融资余额(元)":
+        lines.append(
+            f"上交所融资余额：日期 {sse['date']}，字段 rzye={sse['rzye']}。"
+            "融资融券汇总脚本把 rzye 放在表头“融资余额(元)”下。"
+            f"按该表头换算为 {_decimal(sse['rzye'] / 100000000, 2)} 亿元。"
+        )
+    elif sse:
         lines.append(f"上交所融资余额：日期 {sse['date']}，字段 rzye={sse['rzye']}。")
-        if phrase:
-            lines.append(f"页面单位原文：{phrase}")
-        else:
-            lines.append("页面单位语句没有同时写明融资余额。rzye 的单位未知，不换算。")
+        lines.append("没有取到“融资余额(元)”表头原文。rzye 的单位未知，不换算。")
     else:
         lines.append("上交所融资余额本次没有取到。")
     szse = data.get("szse_margin")
@@ -1393,27 +1485,38 @@ def _render_etf_facts(data: Mapping[str, Any]) -> list[str]:
 def _render_sentiment_facts(data: Mapping[str, Any]) -> list[str]:
     lines = ["### 1.3 情绪面", ""]
     breadth = data.get("breadth") or {}
-    if breadth.get("status") == "ok":
+    limit_up = data.get("limit_up") or {}
+    deferred = breadth.get("status") == "deferred" or limit_up.get("status") == "deferred"
+    if deferred:
+        lines.append(
+            "涨跌家数、涨停和跌停需要收盘后、且返回日期等于行情日。"
+            "当前不是这个条件，本次不采集，也不把盘中或开盘前的零值写成完整结果。请于收盘后再运行。"
+        )
+    elif breadth.get("status") == "ok":
         lines.append(
             f"涨跌分布日期 {breadth.get('qdate')}：上涨 {breadth.get('up')} 家，下跌 {breadth.get('down')} 家，"
             f"平盘 {breadth.get('flat')} 家，合计 {breadth.get('total')} 家。"
         )
-    else:
+    elif not deferred:
         lines.append("涨跌家数本次没有取到。")
-    limit_up = data.get("limit_up") or {}
     limit_down = data.get("limit_down") or {}
-    if limit_up.get("status") == "ok":
+    if deferred:
+        pass
+    elif limit_up.get("status") == "ok":
         lines.append(f"涨停池日期 {limit_up.get('qdate')}，字段 tc={limit_up.get('count')}。")
         if limit_up.get("complete") and limit_up.get("industries"):
             text = "、".join(f"{item['name']} {item['count']} 只" for item in limit_up["industries"][:3])
             lines.append(f"涨停池行业出现次数前 3 名：{text}。")
-    else:
+    elif not deferred:
         lines.append("涨停家数本次没有取到。")
-    if limit_down.get("status") == "ok":
+    if deferred:
+        pass
+    elif limit_down.get("status") == "ok":
         lines.append(f"跌停池日期 {limit_down.get('qdate')}，字段 tc={limit_down.get('count')}。")
     else:
         lines.append("跌停家数本次没有取到。")
-    lines.append("涨停池和跌停池不列证券代码。")
+    if not deferred:
+        lines.append("涨停池和跌停池不列证券代码。")
     for title, board in (("行业", data.get("industries") or {}), ("概念", data.get("concepts") or {})):
         if board.get("status") == "ok":
             source = board.get("source") or "板块列表"
@@ -1429,8 +1532,12 @@ def _render_sentiment_facts(data: Mapping[str, Any]) -> list[str]:
         lines.append(f"与上一份概念名称相比，重合 {len(overlap)} 个。这只是名称比较。")
     elif persistence.get("status") == "same_session":
         lines.append("上一份概念名称与本次行情日期相同，不作为新的持续性证据。")
+    elif persistence.get("status") == "different_source":
+        lines.append("上一份概念名单来源不同，不和本次名单比较。")
+    elif (data.get("concepts") or {}).get("status") == "ok":
+        lines.append("没有可比较的上一交易日同口径概念榜。本次名单会按来源和行情日保存，供下一次比较。")
     else:
-        lines.append("没有可比较的上一交易日概念榜，不判断热点是否持续。")
+        lines.append("本次没有可用的概念涨跌榜，所以没有写入收盘快照。收盘后名单出现涨跌时，会按来源和行情日保存。")
     return lines
 
 
@@ -1494,11 +1601,25 @@ def write_brief(output_dir: str, http_get: HttpGet | None = None, env: Mapping[s
     _atomic_write(os.path.join(output_dir, "latest.evidence.md"), render_evidence(payload))
     coverage_path = os.path.join(output_dir, "latest.coverage.json")
     _atomic_write(coverage_path, json.dumps({"generated_at": payload["generated_at"], "complete": payload["completeness"]["complete"], "rows": _coverage_rows(payload)}, ensure_ascii=False, indent=2) + "\n")
-    names = [row["name"] for row in (payload.get("concepts") or {}).get("top") or []]
-    if names and payload.get("session_date") and payload.get("indices"):
+    concepts = payload.get("concepts") or {}
+    names = [row["name"] for row in concepts.get("top") or []]
+    source = str(concepts.get("source") or "")
+    moved = _board_has_movement([*(concepts.get("top") or []), *(concepts.get("bottom") or [])])
+    if names and payload.get("session_date") and payload.get("indices") and source and moved:
         _atomic_write(
             state_path,
-            json.dumps({"concept_date": payload["session_date"], "names": names, "saved_at": payload["generated_at"]}, ensure_ascii=False, indent=2) + "\n",
+            json.dumps(
+                {
+                    "source": source,
+                    "endpoint": str(concepts.get("host") or ""),
+                    "concept_date": payload["session_date"],
+                    "names": names,
+                    "saved_at": payload["generated_at"],
+                },
+                ensure_ascii=False,
+                indent=2,
+            )
+            + "\n",
         )
     status = "written_failed" if not payload.get("indices") else "written_complete" if payload["completeness"]["complete"] else "written_partial"
     return {
