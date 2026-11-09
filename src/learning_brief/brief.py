@@ -9,14 +9,17 @@ page states that number's unit. Field ratios are not used as unit evidence.
 from __future__ import annotations
 
 import gzip
+import io
 import json
 import os
 import re
 import urllib.parse
 import urllib.request
+import zipfile
 from datetime import datetime, timedelta, timezone
 from html.parser import HTMLParser
 from typing import Any, Callable, Mapping
+from xml.etree import ElementTree as ET
 
 BJ_TZ = timezone(timedelta(hours=8))
 USER_AGENT = (
@@ -43,10 +46,19 @@ def _sina_url() -> str:
 
 SINA_URL = _sina_url()
 EASTMONEY_HOSTS = (
-    "https://17.push2.eastmoney.com",
+    "https://82.push2.eastmoney.com",
+    "https://33.push2.eastmoney.com",
     "https://79.push2.eastmoney.com",
+    "https://17.push2.eastmoney.com",
     "https://push2.eastmoney.com",
+    "https://push2delay.eastmoney.com",
 )
+SINA_BOARD_URLS = {
+    "2": "http://money.finance.sina.com.cn/q/view/newFLJK.php?param=industry",
+    "3": "http://money.finance.sina.com.cn/q/view/newFLJK.php?param=class",
+}
+SZSE_XLSX_URL = "https://www.szse.cn/api/report/ShowReport"
+SSE_DEAL_URL = "https://query.sse.com.cn/commonQuery.do"
 FENBU_URL = (
     "https://push2ex.eastmoney.com/getTopicZDFenBu"
     "?ut=7eea3edcaed734bea9cbfc24409ed989&dpt=wz.ztzt"
@@ -495,6 +507,93 @@ def unit_phrase_for(phrases: list[str], metric: str) -> str:
     return ""
 
 
+def amount_from_unit_header(header: str, raw_text: str, metric: str) -> dict[str, Any] | None:
+    """Convert only when the same header names both the metric and the yuan unit."""
+    if metric not in header or "(元)" not in header:
+        return None
+    try:
+        yuan = float(str(raw_text).replace(",", "").strip())
+    except ValueError:
+        return None
+    return {"header": header, "raw": str(raw_text).strip(), "yuan": yuan, "yi": yuan / 100000000}
+
+
+def parse_xlsx_table(raw: bytes) -> list[list[str]]:
+    ns = "{http://schemas.openxmlformats.org/spreadsheetml/2006/main}"
+    with zipfile.ZipFile(io.BytesIO(raw)) as workbook:
+        shared: list[str] = []
+        if "xl/sharedStrings.xml" in workbook.namelist():
+            root = ET.fromstring(workbook.read("xl/sharedStrings.xml"))
+            for item in root.findall(ns + "si"):
+                shared.append("".join(node.text or "" for node in item.iter(ns + "t")))
+        sheet = ET.fromstring(workbook.read("xl/worksheets/sheet1.xml"))
+    rows: list[list[str]] = []
+    for row in sheet.iter(ns + "row"):
+        values: list[str] = []
+        for cell in row.findall(ns + "c"):
+            kind = cell.attrib.get("t")
+            inline = cell.find(ns + "is")
+            value = cell.find(ns + "v")
+            if inline is not None:
+                values.append("".join(node.text or "" for node in inline.iter(ns + "t")))
+            elif kind == "s" and value is not None and value.text and value.text.isdigit():
+                index = int(value.text)
+                values.append(shared[index] if index < len(shared) else "")
+            elif value is not None and value.text is not None:
+                values.append(value.text)
+            else:
+                values.append("")
+        if any(values):
+            rows.append(values)
+    return rows
+
+
+def labeled_sheet_amount(rows: list[list[str]], row_name: str, metric: str) -> dict[str, Any] | None:
+    if not rows:
+        return None
+    header = rows[0]
+    column = next((index for index, name in enumerate(header) if metric in name and "(元)" in name), None)
+    if column is None:
+        return None
+    for row in rows[1:]:
+        if not row or row[0].strip() != row_name:
+            continue
+        if column >= len(row):
+            return None
+        parsed = amount_from_unit_header(header[column], row[column], metric)
+        if parsed is None:
+            return None
+        parsed["row"] = row_name
+        return parsed
+    return None
+
+
+def parse_sina_board(text: str) -> list[dict[str, Any]]:
+    start = text.find("{")
+    end = text.rfind("}")
+    if start < 0 or end <= start:
+        return []
+    payload = json.loads(text[start : end + 1])
+    rows: list[dict[str, Any]] = []
+    for value in payload.values():
+        parts = str(value).split(",")
+        if len(parts) < 6 or not parts[1].strip():
+            continue
+        try:
+            change = float(parts[5])
+        except ValueError:
+            continue
+        rows.append({"name": parts[1].strip(), "change_pct": change})
+    return rows
+
+
+def parse_sse_stock_trade_amt(payload: Mapping[str, Any]) -> dict[str, str] | None:
+    for row in payload.get("result") or []:
+        if str(row.get("PRODUCT_CODE") or "") == "17" and row.get("TRADE_AMT") not in (None, ""):
+            return {"date": str(row.get("TRADE_DATE") or ""), "trade_amt": str(row.get("TRADE_AMT"))}
+    return None
+
+
 def market_clock(generated: datetime, quote_date: str) -> dict[str, Any]:
     current = beijing_now(generated)
     minutes = current.hour * 60 + current.minute
@@ -533,6 +632,14 @@ def assess_completeness(payload: Mapping[str, Any]) -> dict[str, Any]:
         reasons.append("涨跌家数或涨跌停不齐")
     if not payload.get("verified_docs"):
         reasons.append("没有核对到原始公告正文")
+    if not (payload.get("szse_stock_turnover") or {}).get("header"):
+        reasons.append("没有带表头单位的成交额")
+    industries = payload.get("industries") or {}
+    concepts = payload.get("concepts") or {}
+    if industries.get("status") != "ok" or concepts.get("status") != "ok":
+        reasons.append("行业或概念涨跌榜缺失")
+    if (payload.get("persistence") or {}).get("status") != "compared":
+        reasons.append("没有上一交易日同口径热点名单")
     return {"complete": not reasons, "reasons": reasons, "cache_used": bool(payload.get("cache_used"))}
 
 
@@ -623,6 +730,38 @@ def _board_url(host: str, board_type: str, descending: bool) -> str:
     return host + "/api/qt/clist/get?" + urllib.parse.urlencode(params)
 
 
+def _rank_board(rows: list[dict[str, Any]], limit: int = 5) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+    ordered = sorted(rows, key=lambda item: item["change_pct"])
+    return list(reversed(ordered[-limit:])), ordered[:limit]
+
+
+def _fetch_sina_board(http_get: HttpGet, board_type: str) -> dict[str, Any]:
+    url = SINA_BOARD_URLS[board_type]
+    text = http_get(url, _headers("http://finance.sina.com.cn/stock/sl/"), 20).decode("gb18030", "replace")
+    rows = parse_sina_board(text)
+    if not rows:
+        return {"status": "missing", "error": "sina board empty", "top": [], "bottom": []}
+    top, bottom = _rank_board(rows)
+    return {
+        "status": "ok",
+        "host": url,
+        "source": "新浪板块",
+        "top": top,
+        "bottom": bottom,
+        "note": "数值是新浪板块字符串第6段。板块页列名有“涨跌幅”，数据响应本身没有表头。",
+    }
+
+
+def limit_pool_date_ok(returned: str, requested: str) -> bool:
+    if requested and returned and returned != requested:
+        return False
+    return True
+
+
+def _board_has_movement(rows: list[dict[str, Any]]) -> bool:
+    return any(abs(float(row.get("change_pct") or 0)) > 0 for row in rows)
+
+
 def _fetch_board(http_get: HttpGet, board_type: str) -> dict[str, Any]:
     last_error = "no host attempted"
     for host in EASTMONEY_HOSTS:
@@ -633,12 +772,94 @@ def _fetch_board(http_get: HttpGet, board_type: str) -> dict[str, Any]:
             bottom = parse_board_rows(
                 _get_json(http_get, _board_url(host, board_type, False), _headers("https://quote.eastmoney.com/"), 12)
             )
+            if (top or bottom) and _board_has_movement([*top, *bottom]):
+                return {"status": "ok", "host": host, "source": "东方财富板块", "top": top, "bottom": bottom}
             if top or bottom:
-                return {"status": "ok", "host": host, "top": top, "bottom": bottom}
-            last_error = f"{host} returned no rows"
+                last_error = f"{host} 涨跌幅全部为 0，不作为收盘榜"
+            else:
+                last_error = f"{host} returned no rows"
         except Exception as exc:  # noqa: BLE001
             last_error = _error_text(exc)
-    return {"status": "missing", "error": last_error, "top": [], "bottom": []}
+    try:
+        fallback = _fetch_sina_board(http_get, board_type)
+    except Exception as exc:  # noqa: BLE001
+        fallback = {"status": "missing", "error": last_error + "；新浪：" + _error_text(exc), "top": [], "bottom": []}
+    if fallback.get("status") != "ok":
+        fallback["error"] = last_error if not fallback.get("error") else str(fallback["error"])
+    return fallback
+
+
+def _szse_xlsx(http_get: HttpGet, catalog: str, date_key: str, day: str) -> list[list[str]]:
+    params = {"SHOWTYPE": "xlsx", "CATALOGID": catalog, "TABKEY": "tab1", date_key: day, "random": "0.2"}
+    url = SZSE_XLSX_URL + "?" + urllib.parse.urlencode(params)
+    return parse_xlsx_table(http_get(url, _headers("https://www.szse.cn/"), 25))
+
+
+def _fetch_szse_labeled_amounts(http_get: HttpGet, session_date: str) -> dict[str, Any]:
+    start = datetime.strptime(session_date, "%Y-%m-%d") if session_date else beijing_now()
+    last_error = ""
+    attempted: list[str] = []
+    for offset in range(0, 8):
+        day = (start - timedelta(days=offset)).strftime("%Y-%m-%d")
+        attempted.append(day)
+        rows = None
+        for _retry in range(2):
+            try:
+                rows = _szse_xlsx(http_get, "1803_sczm", "txtQueryDate", day)
+                break
+            except Exception as exc:  # noqa: BLE001
+                last_error = _error_text(exc)
+                rows = None
+        if rows is None:
+            continue
+        stock = labeled_sheet_amount(rows, "股票", "成交金额")
+        etf = labeled_sheet_amount(rows, "ETF", "成交金额")
+        if stock or etf:
+            return {"date": day, "stock": stock, "etf": etf, "attempted_dates": attempted, "error": ""}
+    return {"date": "", "stock": None, "etf": None, "attempted_dates": attempted, "error": last_error}
+
+
+def _fetch_szse_margin_xlsx(http_get: HttpGet, session_date: str) -> dict[str, Any] | None:
+    start = datetime.strptime(session_date, "%Y-%m-%d") if session_date else beijing_now()
+    last_error = ""
+    attempted = []
+    for offset in range(0, 8):
+        day = (start - timedelta(days=offset)).strftime("%Y-%m-%d")
+        attempted.append(day)
+        try:
+            rows = _szse_xlsx(http_get, "1837_xxpl", "txtDate", day)
+        except Exception as exc:  # noqa: BLE001
+            last_error = _error_text(exc)
+            continue
+        if len(rows) < 2:
+            continue
+        parsed = None
+        for index, name in enumerate(rows[0]):
+            if index < len(rows[1]):
+                parsed = amount_from_unit_header(name, rows[1][index], "融资余额")
+            if parsed is not None:
+                break
+        if parsed is None:
+            continue
+        parsed["date"] = day
+        parsed["attempted_dates"] = attempted
+        parsed["source"] = "深交所xlsx"
+        return parsed
+    if last_error:
+        raise RuntimeError(last_error)
+    return None
+
+
+def _fetch_sse_trade_amt(http_get: HttpGet, session_date: str) -> dict[str, str] | None:
+    day = session_date or beijing_now().strftime("%Y-%m-%d")
+    params = {
+        "sqlId": "COMMON_SSE_SJ_GPSJ_CJGK_MRGK_C",
+        "PRODUCT_CODE": "01,02,03,11,17",
+        "type": "inParams",
+        "SEARCH_DATE": day,
+    }
+    url = SSE_DEAL_URL + "?" + urllib.parse.urlencode(params)
+    return parse_sse_stock_trade_amt(_get_json(http_get, url, _headers("https://www.sse.com.cn/")))
 
 
 def _fetch_pool(http_get: HttpGet, url: str, session_date: str) -> dict[str, Any]:
@@ -648,6 +869,16 @@ def _fetch_pool(http_get: HttpGet, url: str, session_date: str) -> dict[str, Any
     if parsed["count"] == 0 and session_date:
         payload = _get_json(http_get, url, _headers("https://quote.eastmoney.com/ztb/"))
         parsed = parse_limit_pool(payload)
+    requested = session_date.replace("-", "") if session_date else ""
+    returned = str(parsed.get("qdate") or "")
+    if not limit_pool_date_ok(returned, requested):
+        return {
+            "status": "missing",
+            "count": None,
+            "qdate": returned,
+            "industries": [],
+            "error": f"返回日期 {returned} 与行情日 {requested} 不一致",
+        }
     parsed["status"] = "ok" if parsed["qdate"] or parsed["count"] else "missing"
     return parsed
 
@@ -810,11 +1041,11 @@ def collect_market(
     if isinstance(breadth, dict):
         data = breadth.get("data") or {}
         if data.get("fenbu"):
-            breadth_parsed = {
-                "status": "ok",
-                "qdate": str(data.get("qdate") or ""),
-                **summarize_fenbu(data.get("fenbu") or []),
-            }
+            counted = summarize_fenbu(data.get("fenbu") or [])
+            if counted["total"] > 0:
+                breadth_parsed = {"status": "ok", "qdate": str(data.get("qdate") or ""), **counted}
+            else:
+                errors.append({"source": "东方财富涨跌分布", "error": "分布合计为 0，不作为有效涨跌家数"})
     limit_up = _safe_call("东方财富涨停池", lambda: _fetch_pool(getter, ZT_URL, session_date), errors)
     limit_down = _safe_call("东方财富跌停池", lambda: _fetch_pool(getter, DT_URL, session_date), errors)
     industries = _safe_call("东方财富行业板块", lambda: _fetch_board(getter, "2"), errors) or {
@@ -828,7 +1059,11 @@ def collect_market(
         "bottom": [],
     }
     sse_margin = _safe_call("上交所融资融券汇总", lambda: _fetch_sse_margin(getter), errors)
-    szse_margin = _safe_call("深交所融资融券汇总", lambda: _fetch_szse_margin(getter, session_date), errors)
+    szse_margin = _safe_call("深交所融资余额表", lambda: _fetch_szse_margin_xlsx(getter, session_date), errors)
+    if not szse_margin:
+        szse_margin = _safe_call("深交所融资融券汇总", lambda: _fetch_szse_margin(getter, session_date), errors)
+    szse_amounts = _safe_call("深交所证券类别统计", lambda: _fetch_szse_labeled_amounts(getter, session_date), errors) or {}
+    sse_trade_amt = _safe_call("上交所股票成交概况", lambda: _fetch_sse_trade_amt(getter, session_date), errors)
     em_margin = _safe_call("东方财富融资融券汇总", lambda: _fetch_em_margin(getter), errors)
     etf = _safe_call("上交所ETF份额", lambda: _fetch_etf_pair(getter, session_date), errors) or {
         "status": "missing",
@@ -855,6 +1090,9 @@ def collect_market(
     for label, board in (("东方财富行业板块", industries), ("东方财富概念板块", concepts)):
         if board.get("status") != "ok" and board.get("error"):
             errors.append({"source": label, "error": board["error"]})
+    for label, pool in (("涨停池", limit_up), ("跌停池", limit_down)):
+        if isinstance(pool, dict) and pool.get("status") != "ok" and pool.get("error"):
+            errors.append({"source": label, "error": pool["error"]})
     payload = {
         "generated_at": format_stamp(current),
         "session_date": session_date,
@@ -874,6 +1112,11 @@ def collect_market(
         "sse_margin": sse_margin,
         "szse_margin": szse_margin,
         "em_margin": em_margin,
+        "szse_stock_turnover": szse_amounts.get("stock"),
+        "szse_etf_turnover": szse_amounts.get("etf"),
+        "szse_amount_date": szse_amounts.get("date") or "",
+        "szse_amount_attempted": szse_amounts.get("attempted_dates") or [],
+        "sse_trade_amt": sse_trade_amt,
         "sse_unit_phrases": sse_unit_phrases,
         "em_unit_phrases": em_unit_phrases,
         "etf": etf,
@@ -976,12 +1219,12 @@ def render_brief(payload: Mapping[str, Any]) -> str:
         lines.append("")
     lines.extend(_render_price_facts(data))
     lines.extend(_render_margin_facts(data))
-    lines.extend(_render_etf_facts(data.get("etf") or {}))
+    lines.extend(_render_etf_facts(data))
     lines.extend(_render_sentiment_facts(data))
     lines.extend(["", "## 2. 解释", ""])
     lines.extend(
         [
-            "指数点位和涨跌来自新浪行情里的价格字段。成交额只保留原值，因为这次响应没有写出单位。",
+            "表头同时写出指标和“(元)”的交易所数字，按原值除以 100000000 读成亿元。没有单位原文的字段保持原值。",
             "融资余额按各自日期并列。日期不同的数字不相加。",
             "涨跌家数是分布桶里的计数相加。涨停和跌停以专题池的 tc 为准。",
             "行业和概念涨跌幅是价格变动。它们不说明业绩或政策。",
@@ -997,8 +1240,8 @@ def render_brief(payload: Mapping[str, Any]) -> str:
         lines.append(f"- 上交所ETF份额字段：{item}")
     lines.extend(
         [
-            "- 成交额、融资余额和 ETF 份额原值在没有对应单位原文时，都不换算。",
-            "- 交易所公布的全市场股票成交额、深市 ETF 份额，以及带货币单位的申购或赎回数据，本次没有取得。",
+            "- 没有单位原文的成交额和融资余额不换算。上交所 TRADE_AMT 与新浪成交额字段属于这类。",
+            "- 深市 ETF 份额，以及申购或赎回的货币金额，本次没有取得。深交所 ETF 行只表示成交金额。",
             "- 主力资金流没有采集。",
             "- 热点是否持续：没有同口径多日样本时保持未知。",
             "- 模型综述保持未知。",
@@ -1034,6 +1277,25 @@ def render_brief(payload: Mapping[str, Any]) -> str:
 
 def _render_price_facts(data: Mapping[str, Any]) -> list[str]:
     lines = ["### 1.2 资金面", ""]
+    stock = data.get("szse_stock_turnover") or {}
+    if stock.get("header"):
+        lines.append(
+            f"深交所股票成交金额：日期 {data.get('szse_amount_date')}，表头原文“{stock['header']}”，"
+            f"数值 {stock['raw']} 元。按该表头换算为 {_decimal(stock['yi'], 2)} 亿元。"
+            + (
+                f"尝试日期：{'、'.join(data.get('szse_amount_attempted') or [])}。"
+                if data.get("szse_amount_attempted")
+                else ""
+            )
+        )
+    else:
+        lines.append("深交所带表头的股票成交金额本次没有取到。")
+    sse_amt = data.get("sse_trade_amt") or {}
+    if sse_amt.get("trade_amt"):
+        lines.append(
+            f"上交所股票成交概况：日期 {sse_amt.get('date')}，产品代码 17，字段 TRADE_AMT={sse_amt['trade_amt']}。"
+            "该 JSON 没有单位，不换算。"
+        )
     indices = [row for row in data.get("indices") or [] if row.get("code") in TURNOVER_CODES]
     if not indices:
         lines.append("上证指数和深证成指本次没有取到。")
@@ -1065,7 +1327,14 @@ def _render_margin_facts(data: Mapping[str, Any]) -> list[str]:
     else:
         lines.append("上交所融资余额本次没有取到。")
     szse = data.get("szse_margin")
-    if szse:
+    if szse and szse.get("header"):
+        attempted = "、".join(szse.get("attempted_dates") or [])
+        lines.append(
+            f"深交所融资余额：日期 {szse.get('date')}，表头原文“{szse['header']}”，数值 {szse['raw']} 元。"
+            f"按该表头换算为 {_decimal(szse['yi'], 2)} 亿元。"
+            + (f"尝试日期：{attempted}。" if attempted else "")
+        )
+    elif szse:
         attempted = "、".join(szse.get("attempted_dates") or [])
         lines.append(
             f"深交所融资余额：查询日期 {szse['date']}，字段 jrrzye={szse['balance_raw']}。"
@@ -1088,15 +1357,27 @@ def _render_margin_facts(data: Mapping[str, Any]) -> list[str]:
     return lines
 
 
-def _render_etf_facts(etf: Mapping[str, Any]) -> list[str]:
+def _render_etf_facts(data: Mapping[str, Any]) -> list[str]:
+    etf_turnover = data.get("szse_etf_turnover") or {}
+    lines: list[str] = []
+    if etf_turnover.get("header"):
+        lines.append(
+            f"深交所 ETF 成交金额：日期 {data.get('szse_amount_date')}，表头原文“{etf_turnover['header']}”，"
+            f"数值 {etf_turnover['raw']} 元。按该表头换算为 {_decimal(etf_turnover['yi'], 2)} 亿元。"
+            "这是成交金额，不是份额变化。"
+        )
+    else:
+        lines.append("深交所 ETF 成交金额本次没有取到。深市份额变化保持未知。")
+    etf = data.get("etf") or {}
     newer = etf.get("newer")
     older = etf.get("older")
     if not newer:
-        return ["上交所 ETF 份额原值本次没有取到。", ""]
-    lines = [
+        lines.extend(["上交所 ETF 份额原值本次没有取到。", ""])
+        return lines
+    lines.append(
         f"上交所 TOT_VOL 原值合计：{newer.get('stat_date')} 为 {_decimal(float(newer.get('sum_raw') or 0), 2)}，"
         f"共 {newer.get('rows')} 行，接口 total={newer.get('reported_total')}。"
-    ]
+    )
     if older and newer.get("complete") and older.get("complete"):
         delta = float(newer["sum_raw"]) - float(older["sum_raw"])
         lines.append(
@@ -1135,8 +1416,11 @@ def _render_sentiment_facts(data: Mapping[str, Any]) -> list[str]:
     lines.append("涨停池和跌停池不列证券代码。")
     for title, board in (("行业", data.get("industries") or {}), ("概念", data.get("concepts") or {})):
         if board.get("status") == "ok":
-            lines.append(f"{title}涨幅前 3 名：" + _board_text((board.get("top") or [])[:3]))
+            source = board.get("source") or "板块列表"
+            lines.append(f"{title}涨幅前 3 名（{source}）：" + _board_text((board.get("top") or [])[:3]))
             lines.append(f"{title}跌幅前 3 名：" + _board_text((board.get("bottom") or [])[:3]))
+            if board.get("note"):
+                lines.append(board["note"])
         else:
             lines.append(f"{title}涨跌榜本次没有取到。")
     persistence = data.get("persistence") or {}

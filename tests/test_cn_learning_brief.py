@@ -10,6 +10,11 @@ from datetime import datetime, timezone, timedelta
 
 from src.learning_brief.brief import (
     accept_official_article,
+    amount_from_unit_header,
+    labeled_sheet_amount,
+    limit_pool_date_ok,
+    parse_sina_board,
+    parse_sse_stock_trade_amt,
     assess_completeness,
     classify_headline,
     collect_market,
@@ -171,7 +176,9 @@ class LearningBriefRenderTests(unittest.TestCase):
         self.assertIn("1168836509671", text)
         self.assertNotIn("11688.37", text)
         self.assertNotIn("16577.93", text)
-        self.assertNotIn("亿元", text)
+        raw_lines = [line for line in text.splitlines() if "rzye=" in line or "成交额字段原值" in line]
+        self.assertTrue(raw_lines)
+        self.assertFalse(any("亿元" in line for line in raw_lines))
         self.assertIn("单位未知", text)
         self.assertIn("不是完整简报", text)
 
@@ -320,6 +327,45 @@ class LearningBriefRenderTests(unittest.TestCase):
             self.assertNotIn("SENTINEL-16577.93", text)
             self.assertIn("不是完整简报", text)
             self.assertIn("不沿用上一份", text)
+
+    def test_header_yuan_converts_and_unlabeled_field_does_not(self):
+        parsed = amount_from_unit_header("成交金额(元)", "100,000,000.00", "成交金额")
+        self.assertEqual(parsed["yi"], 1)
+        self.assertIsNone(amount_from_unit_header("成交金额", "7732.82", "成交金额"))
+        self.assertIsNone(amount_from_unit_header("融券单位：股", "1090179947092", "融资余额"))
+        rows = [["证券类别", "成交金额(元)"], ["股票", "200,000,000"], ["ETF", "50,000,000"]]
+        self.assertEqual(labeled_sheet_amount(rows, "股票", "成交金额")["yi"], 2)
+        self.assertIsNone(parse_sse_stock_trade_amt({"result": [{"PRODUCT_CODE": "17", "TRADE_AMT": "7732.82", "TRADE_DATE": "20261106"}]}).get("yi"))
+        board = parse_sina_board('var x = {"a":"hangye_ZA01,农业,15,8.7,0.05,0.67,1,2"};')
+        self.assertEqual(board[0]["name"], "农业")
+        text = render_brief(
+            {
+                "generated_at": "2026-11-09 16:10:00",
+                "session_date": "2026-11-09",
+                "indices": [],
+                "breadth": {"status": "missing"},
+                "limit_up": {"status": "missing"},
+                "limit_down": {"status": "missing"},
+                "industries": {"status": "missing"},
+                "concepts": {"status": "missing"},
+                "persistence": {"status": "unknown"},
+                "sse_margin": None,
+                "szse_margin": None,
+                "em_margin": None,
+                "etf": {"errors": []},
+                "lesson": concept_for_date(datetime(2026, 11, 9, 16, 10, tzinfo=BJ)),
+                "errors": [],
+                "key_presence": {},
+                "verified_docs": [],
+                "szse_amount_date": "2026-11-09",
+                "szse_stock_turnover": parsed,
+            }
+        )
+        self.assertIn("表头原文“成交金额(元)”", text)
+        self.assertIn("1.00 亿元", text)
+        self.assertIn("不是完整简报", text)
+        self.assertFalse(limit_pool_date_ok("20261109", "20261106"))
+        self.assertTrue(limit_pool_date_ok("20261106", "20261106"))
 
 
 if __name__ == "__main__":
