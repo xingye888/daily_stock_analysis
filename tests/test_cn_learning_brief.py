@@ -9,18 +9,26 @@ import unittest
 from datetime import datetime, timezone, timedelta
 
 from src.learning_brief.brief import (
+    accept_official_article,
+    assess_completeness,
     classify_headline,
     collect_market,
     concept_for_date,
+    extract_unit_phrases,
+    extract_zoom_text,
+    market_clock,
     merge_index_quotes,
     parse_eastmoney_margin,
     parse_etf_page,
     parse_kuaixun,
     parse_limit_pool,
+    parse_pbc_article,
+    parse_pbc_links,
     parse_sina_quotes,
     parse_sse_margin,
     render_brief,
     summarize_fenbu,
+    unit_phrase_for,
     write_brief,
 )
 
@@ -43,8 +51,8 @@ class LearningBriefParseTests(unittest.TestCase):
         merged = merge_index_quotes(parse_sina_quotes(SINA_FIXTURE))
         shanghai = next(row for row in merged if row["code"] == "sh000001")
         self.assertEqual(shanghai["quote_date"], "2026-11-06")
-        self.assertEqual(shanghai["amount_yuan"], 772634566231)
-        self.assertTrue(shanghai["amount_unit_checked"])
+        self.assertEqual(shanghai["amount_field"], 772634566231)
+        self.assertNotIn("amount_unit_checked", shanghai)
         self.assertAlmostEqual(shanghai["change"], -40.7335, places=3)
 
     def test_fenbu_counts_do_not_treat_buckets_as_limits(self):
@@ -161,10 +169,11 @@ class LearningBriefRenderTests(unittest.TestCase):
         text = render_brief(payload)
         self.assertIn("772634566231", text)
         self.assertIn("1168836509671", text)
-        explanation = text.split("## 2. 解释", 1)[1].split("## 3. 未知", 1)[0]
-        self.assertIn("亿元", explanation)
-        facts = text.split("## 1. 事实", 1)[1].split("## 2. 解释", 1)[0]
-        self.assertNotIn("11688.37", facts)
+        self.assertNotIn("11688.37", text)
+        self.assertNotIn("16577.93", text)
+        self.assertNotIn("亿元", text)
+        self.assertIn("单位未知", text)
+        self.assertIn("不是完整简报", text)
 
     def test_module_does_not_import_notification_or_llm(self):
         path = os.path.join(os.path.dirname(__file__), "..", "src", "learning_brief", "brief.py")
@@ -192,12 +201,125 @@ class LearningBriefRenderTests(unittest.TestCase):
 
         with tempfile.TemporaryDirectory() as directory:
             result = write_brief(directory, http_get=http_get, env={})
-            self.assertEqual(result["status"], "written")
+            self.assertEqual(result["status"], "written_partial")
+            self.assertEqual(result["complete"], "false")
             self.assertTrue(os.path.exists(result["markdown"]))
             with open(os.path.join(directory, "hot_concepts_state.json"), encoding="utf-8") as handle:
                 state = json.load(handle)
             self.assertEqual(state["concept_date"], "2026-11-06")
             self.assertIn("样本概念", state["names"])
+
+    def test_share_delta_is_not_described_as_money(self):
+        payload = {
+            "generated_at": "2026-11-08 21:00:00",
+            "session_date": "2026-11-06",
+            "indices": [],
+            "breadth": {"status": "missing"},
+            "limit_up": {"status": "missing"},
+            "limit_down": {"status": "missing"},
+            "industries": {"status": "missing"},
+            "concepts": {"status": "missing"},
+            "persistence": {"status": "unknown"},
+            "sse_margin": None,
+            "szse_margin": None,
+            "em_margin": None,
+            "etf": {
+                "newer": {"stat_date": "2026-11-06", "sum_raw": 30, "rows": 2, "reported_total": 2, "complete": True},
+                "older": {"stat_date": "2026-11-05", "sum_raw": 10, "rows": 2, "reported_total": 2, "complete": True},
+                "errors": [],
+            },
+            "lesson": concept_for_date(datetime(2026, 11, 8, tzinfo=BJ)),
+            "errors": [],
+            "key_presence": {},
+            "verified_docs": [],
+        }
+        text = render_brief(payload)
+        delta_line = next(line for line in text.splitlines() if "差额" in line)
+        self.assertIn("+20.00", delta_line)
+        self.assertNotIn("净流入", delta_line)
+        self.assertNotIn("申赎", delta_line)
+        self.assertNotIn("亿元", delta_line)
+
+    def test_keyword_titles_are_not_fundamental_facts(self):
+        payload = collect_market(
+            http_get=lambda url, headers, timeout: b"{}",
+            now=datetime(2026, 11, 9, 8, 0, tzinfo=BJ),
+            env={},
+        )
+        text = render_brief(payload)
+        self.assertIn("基本面保持未知", text)
+        self.assertNotIn("关键词", text)
+        self.assertIn("开盘前", text)
+        self.assertIn("不是完整简报", text)
+
+    def test_verified_article_is_quoted_from_body(self):
+        html = """
+        <html><title>样本再贷款政策</title>
+        <meta name="createDate" content="2026-11-04 09:04:10" />
+        <div id="zoom"><p>为维护资本市场平稳运行，下调股票回购增持再贷款利率0.25个百分点至1%。支持对象为21家全国性银行，支持比例为100%，期限1年。</p>打印本页</div>
+        </html>
+        """
+        article = parse_pbc_article(html, "http://www.pbc.gov.cn/sample/index.html")
+        self.assertIn("0.25个百分点", article["text"])
+        self.assertNotIn("打印本页", article["text"])
+        links = parse_pbc_links(
+            '<a href="/goutongjiaoliu/a/index.html">国务院关于金融工作情况的报告</a>'
+            '<a href="/goutongjiaoliu/b/index.html">互换便利操作结果公告</a>'
+            '<a href="/goutongjiaoliu/c/index.html">行长会见来宾</a>'
+            '<a href="/goutongjiaoliu/d/index.html">中国京剧艺术普通纪念币公告</a>'
+        )
+        self.assertEqual([item["title"] for item in links], ["互换便利操作结果公告", "国务院关于金融工作情况的报告"])
+        phrases = extract_unit_phrases("余券应划转量。融券单位：股（标的证券为股票）。")
+        self.assertTrue(phrases and phrases[0].startswith("融券单位"))
+        self.assertEqual(unit_phrase_for(phrases, "融资余额"), "")
+        self.assertFalse(accept_official_article({"title": "中国人民银行公告第28号", "text": "定于发行普通纪念币一枚。"}))
+        payload = {
+            "generated_at": "2026-11-09 08:00:00",
+            "session_date": "2026-11-06",
+            "indices": [],
+            "breadth": {"status": "missing"},
+            "limit_up": {"status": "missing"},
+            "limit_down": {"status": "missing"},
+            "industries": {"status": "missing"},
+            "concepts": {"status": "missing"},
+            "persistence": {"status": "unknown"},
+            "sse_margin": None,
+            "szse_margin": None,
+            "em_margin": None,
+            "etf": {"status": "missing", "errors": []},
+            "lesson": concept_for_date(datetime(2026, 11, 9, tzinfo=BJ)),
+            "errors": [],
+            "key_presence": {},
+            "verified_docs": [article],
+        }
+        text = render_brief(payload)
+        facts = text.split("### 1.1 基本面", 1)[1].split("### 1.2", 1)[0]
+        self.assertIn("0.25个百分点", facts)
+        self.assertIn("原始页面正文", facts)
+
+    def test_unrelated_unit_phrase_does_not_convert_margin(self):
+        self.assertEqual(unit_phrase_for(["融券单位：股（标的证券为股票）"], "融资余额"), "")
+        self.assertEqual(extract_zoom_text('<div id="zoom">正文足够长。' + ("补充" * 30) + "打印本页<footer>页脚</footer></div>").find("页脚"), -1)
+
+    def test_monday_morning_is_not_a_closing_brief(self):
+        clock = market_clock(datetime(2026, 11, 9, 8, 20, tzinfo=BJ), "2026-11-06")
+        verdict = assess_completeness({"clock": clock, "indices": [{"code": "sh000001"}, {"code": "sz399001"}], "breadth": {"status": "ok"}, "limit_up": {"status": "ok"}, "limit_down": {"status": "ok"}, "verified_docs": [{"title": "x"}], "cache_used": False})
+        self.assertFalse(verdict["complete"])
+        self.assertIn("行情日期不是生成日期", verdict["reasons"])
+        self.assertIn("生成时不在收盘后", verdict["reasons"])
+
+    def test_failed_run_does_not_keep_previous_brief_numbers(self):
+        with tempfile.TemporaryDirectory() as directory:
+            previous = os.path.join(directory, "latest.md")
+            with open(previous, "w", encoding="utf-8") as handle:
+                handle.write("过期数字 SENTINEL-16577.93 亿元 完整简报")
+            result = write_brief(directory, http_get=lambda url, headers, timeout: b"{}", env={})
+            self.assertEqual(result["status"], "written_failed")
+            with open(previous, encoding="utf-8") as handle:
+                text = handle.read()
+            self.assertNotIn("SENTINEL-16577.93", text)
+            self.assertIn("不是完整简报", text)
+            self.assertIn("不沿用上一份", text)
 
 
 if __name__ == "__main__":

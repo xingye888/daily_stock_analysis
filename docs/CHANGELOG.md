@@ -9,6 +9,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+- [修复] A股学习简报不再用字段比值或页面惯例把原值换成亿元；基本面改为摘录已打开的中国人民银行公告正文；ETF 份额原值差额不再称作金额；休市、日期不一致和采集失败都会标明不是完整简报，并且不把上一份文件里的数字写回 `latest.md`
 - [新功能] 新增免密钥 A 股全市场学习简报 `python -m src.learning_brief`：分开写入事实、解释和未知，不调用 LLM、不发送通知、不连接券商；可选输出目录为 `CN_LEARNING_BRIEF_OUTPUT_DIR`
 - [修复] 启动日志不再对 `--stocks` / `--portfolio` / `--no-notify` 已覆盖的配置项告警；单一日线数据源失败（含 Eastmoney 股票与 ETF 请求）降为 WARNING，普通股票及 A 股指数全部日线数据源失败仍为 ERROR；LLM 返回与调试日志显示实际响应模型（含流式响应），依据实际调用路由标注回退，避免将别名、供应商前缀和日期版本差异误报为回退
 - [文档] 修正 DeepSeek 默认模型说明，明确 Gemini API 与 Vertex AI 的模型生命周期及验证边界。

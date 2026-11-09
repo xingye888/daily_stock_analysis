@@ -54,7 +54,7 @@ Grok Bot Skill 正文见 [`docs/examples/grok_bot/SKILL.md`](examples/grok_bot/S
 
 A 股全市场学习简报是独立命令 `python -m src.learning_brief`，说明见 [A股学习简报](cn-learning-brief.md)。它不调用本页的大盘复盘 API，不创建第二个定时任务，也不走通知渠道。
 
-已经安排在工作日 16:30（北京时间）发送简报的 Grok Bot，应读取持续运行目录里的 `latest.md`。文件缺失或日期不是当次生成时间时，只说明没有新简报，不另外补写数字。
+已经安排在工作日 16:30（北京时间）发送简报的 Grok Bot，应在同一次任务里运行采集并读取刚写出的 `latest.md`。文件写明「不是完整简报」或「本次没有形成简报」时，只说明这个状态，不用上一份文件补写数字。不改这个任务的触发时间。
 
 ## Skill：大盘复盘
 

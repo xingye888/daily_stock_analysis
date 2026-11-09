@@ -29,10 +29,10 @@ def main(argv: list[str] | None = None) -> int:
         print(f"status=write_failed error={exc}", file=sys.stderr)
         return 1
     print(
-        "status={status} llm=blocked notifications_sent=false "
+        "status={status} complete={complete} llm=blocked notifications_sent=false "
         "markdown={markdown} coverage={coverage}".format(**result)
     )
-    return 0 if result["status"] == "written" else 2
+    return 0 if result["status"] != "written_failed" else 2
 
 
 if __name__ == "__main__":

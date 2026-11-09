@@ -2,18 +2,20 @@
 """Collect a keyless A-share learning brief and render facts, notes, and gaps.
 
 This module does not import the notification stack, does not call an LLM, and
-does not log in to a broker. Converted units stay in the explanation section
-when the source payload itself does not declare a unit.
+does not log in to a broker. A number is converted only when the same source
+page states that number's unit. Field ratios are not used as unit evidence.
 """
 
 from __future__ import annotations
 
+import gzip
 import json
 import os
 import re
 import urllib.parse
 import urllib.request
 from datetime import datetime, timedelta, timezone
+from html.parser import HTMLParser
 from typing import Any, Callable, Mapping
 
 BJ_TZ = timezone(timedelta(hours=8))
@@ -63,9 +65,6 @@ SSE_MARGIN_URL = "https://query.sse.com.cn/marketdata/tradedata/queryMargin.do"
 SZSE_MARGIN_URL = "https://www.szse.cn/api/report/ShowReport/data"
 EM_MARGIN_URL = "https://datacenter-web.eastmoney.com/api/data/v1/get"
 SSE_ETF_URL = "https://query.sse.com.cn/commonQuery.do"
-KUAIXUN_URL = "https://newsapi.eastmoney.com/kuaixun/v1/getlist_102_ajaxResult_50_1_.html"
-EM_COLUMN_URL = "https://np-listapi.eastmoney.com/comm/web/getNewsByColumns"
-
 HEADLINE_RULES = (
     ("宏观", ("国务院", "国常会", "央行", "人民银行", "统计局", "GDP", "CPI", "PMI", "降准", "降息", "财政", "MLF", "LPR")),
     ("政策", ("证监会", "交易所", "监管", "稳市", "印花税", "国务院", "国常会")),
@@ -117,10 +116,16 @@ def _signed(value: float, digits: int = 2) -> str:
     return f"{value:+.{digits}f}"
 
 
+def _maybe_decompress(raw: bytes, content_encoding: str = "") -> bytes:
+    if "gzip" in content_encoding.lower() or raw.startswith(b"\x1f\x8b"):
+        return gzip.decompress(raw)
+    return raw
+
+
 def default_http_get(url: str, headers: Mapping[str, str], timeout: float) -> bytes:
     request = urllib.request.Request(url, headers=dict(headers))
     with urllib.request.urlopen(request, timeout=timeout) as response:
-        return response.read()
+        return _maybe_decompress(response.read(), response.headers.get("Content-Encoding") or "")
 
 
 def _get_json(http_get: HttpGet, url: str, headers: Mapping[str, str], timeout: float = 20) -> Any:
@@ -176,7 +181,7 @@ def parse_sina_quotes(text: str) -> list[dict[str, Any]]:
                 "prev_close": prev_close,
                 "change": change,
                 "change_pct": change_pct,
-                "amount_yuan": float(parts[9]),
+                "amount_field": float(parts[9]),
                 "quote_date": parts[30],
                 "quote_time": parts[31],
             }
@@ -185,6 +190,7 @@ def parse_sina_quotes(text: str) -> list[dict[str, Any]]:
 
 
 def merge_index_quotes(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Keep both Sina fields. Their ratio is not evidence of a currency unit."""
     full = {row["code"]: row for row in rows if row["kind"] == "full"}
     summary = {row["code"]: row for row in rows if row["kind"] == "summary"}
     merged: list[dict[str, Any]] = []
@@ -193,19 +199,7 @@ def merge_index_quotes(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
         if item is None:
             continue
         brief = summary.get(code)
-        ratio = None
-        amount_summary = None
-        if brief and brief.get("amount_summary"):
-            amount_summary = brief["amount_summary"]
-            ratio = item["amount_yuan"] / amount_summary
-        merged.append(
-            {
-                **item,
-                "amount_summary": amount_summary,
-                "amount_ratio": ratio,
-                "amount_unit_checked": ratio is not None and 9000 <= ratio <= 11000,
-            }
-        )
+        merged.append({**item, "amount_summary": None if brief is None else brief.get("amount_summary")})
     return merged
 
 
@@ -382,6 +376,166 @@ def classify_headline(title: str) -> list[str]:
     return labels
 
 
+PBC_INDEX_URL = "http://www.pbc.gov.cn/goutongjiaoliu/113456/113469/index.html"
+PBC_ORIGIN = "http://www.pbc.gov.cn"
+SSE_MARGIN_PAGE = "https://www.sse.com.cn/market/othersdata/margin/sum/"
+EM_MARGIN_PAGE = "https://data.eastmoney.com/rzrq/zhtjday.html"
+_PBC_KEEP = ("公告", "政策", "贷款", "报告")
+_PBC_SKIP = ("会见", "出席", "英文", "English", "纪念币")
+
+
+class _ZoomText(HTMLParser):
+    def __init__(self) -> None:
+        super().__init__()
+        self._active = 0
+        self._depth = 0
+        self._skip = 0
+        self.parts: list[str] = []
+
+    def handle_starttag(self, tag: str, attrs: list[tuple[str, str | None]]) -> None:
+        if tag in ("script", "style"):
+            self._skip += 1
+        if dict(attrs).get("id") == "zoom":
+            self._active = 1
+            self._depth = 1
+            return
+        if self._active and tag == "div":
+            self._depth += 1
+
+    def handle_endtag(self, tag: str) -> None:
+        if tag in ("script", "style") and self._skip:
+            self._skip -= 1
+        if self._active and tag == "div":
+            self._depth -= 1
+            if self._depth <= 0:
+                self._active = 0
+
+    def handle_data(self, data: str) -> None:
+        if self._active and not self._skip:
+            self.parts.append(data)
+
+
+def extract_zoom_text(html: str) -> str:
+    parser = _ZoomText()
+    parser.feed(html)
+    text = re.sub(r"\s+", " ", "".join(parser.parts)).strip()
+    for marker in ("打印本页", "法律声明", "关闭窗口"):
+        if marker in text:
+            text = text.split(marker, 1)[0].strip()
+    return text
+
+
+def parse_pbc_links(html: str) -> list[dict[str, str]]:
+    found: list[dict[str, str]] = []
+    seen: set[str] = set()
+    for href, title in re.findall(r'href="([^"]+)"[^>]*>([^<]{8,160})</a>', html):
+        name = re.sub(r"\s+", " ", title).strip()
+        if any(word in name for word in _PBC_SKIP):
+            continue
+        if not any(word in name for word in _PBC_KEEP):
+            continue
+        if href.startswith("/"):
+            url = PBC_ORIGIN + href
+        elif href.startswith("http://www.pbc.gov.cn/") or href.startswith("https://www.pbc.gov.cn/"):
+            url = href
+        else:
+            continue
+        if url in seen:
+            continue
+        seen.add(url)
+        found.append({"title": name, "url": url, "source": "中国人民银行"})
+
+    def _rank(item: dict[str, str]) -> int:
+        title = item["title"]
+        if "公告" in title:
+            return 0
+        if "贷款" in title or "政策" in title:
+            return 1
+        if "报告" in title:
+            return 2
+        return 3
+
+    found.sort(key=_rank)
+    return found
+
+
+def parse_pbc_article(html: str, url: str) -> dict[str, str] | None:
+    title_match = re.search(r"<title>(.*?)</title>", html, flags=re.I | re.S)
+    date_match = re.search(r'name="createDate"\s+content="([^"]+)"', html, flags=re.I)
+    body = extract_zoom_text(html)
+    if title_match is None or len(body) < 60:
+        return None
+    return {
+        "source": "中国人民银行",
+        "kind": "原始页面",
+        "title": re.sub(r"\s+", " ", title_match.group(1)).strip(),
+        "published": date_match.group(1).strip() if date_match else "",
+        "url": url,
+        "text": body[:500],
+    }
+
+
+def extract_unit_phrases(html: str) -> list[str]:
+    cleaned = re.sub(r"<script[\s\S]*?</script>", " ", html, flags=re.I)
+    cleaned = re.sub(r"<style[\s\S]*?</style>", " ", cleaned, flags=re.I)
+    cleaned = re.sub(r"<[^>]+>", " ", cleaned)
+    cleaned = re.sub(r"\s+", " ", cleaned)
+    phrases: list[str] = []
+    for match in re.finditer(r"[\u4e00-\u9fff]{0,8}单位[:：][^。；]{0,36}", cleaned):
+        phrase = match.group(0).strip()
+        if phrase and phrase not in phrases:
+            phrases.append(phrase)
+    return phrases[:4]
+
+
+def unit_phrase_for(phrases: list[str], metric: str) -> str:
+    for phrase in phrases:
+        if metric in phrase:
+            return phrase
+    return ""
+
+
+def market_clock(generated: datetime, quote_date: str) -> dict[str, Any]:
+    current = beijing_now(generated)
+    minutes = current.hour * 60 + current.minute
+    if current.isoweekday() >= 6:
+        phase = "周末休市"
+    elif minutes < 9 * 60 + 30:
+        phase = "开盘前"
+    elif minutes < 15 * 60:
+        phase = "交易时段"
+    else:
+        phase = "收盘后"
+    quote = quote_date or ""
+    return {
+        "generated_date": current.strftime("%Y-%m-%d"),
+        "quote_date": quote,
+        "phase": phase,
+        "quote_is_generation_date": bool(quote) and quote == current.strftime("%Y-%m-%d"),
+    }
+
+
+def assess_completeness(payload: Mapping[str, Any]) -> dict[str, Any]:
+    clock = payload.get("clock") or {}
+    codes = {row.get("code") for row in payload.get("indices") or []}
+    reasons: list[str] = []
+    if payload.get("cache_used"):
+        reasons.append("使用了过期缓存")
+    if not {"sh000001", "sz399001"} <= codes:
+        reasons.append("缺少上证或深证行情")
+    if not clock.get("quote_is_generation_date"):
+        reasons.append("行情日期不是生成日期")
+    if clock.get("phase") != "收盘后":
+        reasons.append("生成时不在收盘后")
+    breadth_ok = (payload.get("breadth") or {}).get("status") == "ok"
+    limits_ok = (payload.get("limit_up") or {}).get("status") == "ok" and (payload.get("limit_down") or {}).get("status") == "ok"
+    if not breadth_ok or not limits_ok:
+        reasons.append("涨跌家数或涨跌停不齐")
+    if not payload.get("verified_docs"):
+        reasons.append("没有核对到原始公告正文")
+    return {"complete": not reasons, "reasons": reasons, "cache_used": bool(payload.get("cache_used"))}
+
+
 def concept_for_date(current: datetime) -> dict[str, str]:
     lessons = {
         1: (
@@ -405,9 +559,9 @@ def concept_for_date(current: datetime) -> dict[str, str]:
             "要讨论持续性，至少需要同一来源、同一口径在多个交易日的名单，并记下停更和改名。",
         ),
         5: (
-            "ETF份额和申赎",
-            "ETF份额变化可以提供申购和赎回方向的线索。份额增加不等于已经知道申购金额，"
-            "因为还缺净值和深市等其他市场的份额。场内买卖成交额也是另一套数字。",
+            "ETF份额字段",
+            "份额字段记录份额规模。两个日期的原值相减，只说明份额合计变了。"
+            "原值没有货币单位时，不能把差额写成金额。",
         ),
         6: (
             "行情日期和发布日期",
@@ -416,8 +570,8 @@ def concept_for_date(current: datetime) -> dict[str, str]:
         ),
         7: (
             "事实、解释和未知",
-            "事实保留接口里的原值、日期和来源。解释说明字段含义、单位换算和不能推出的范围。"
-            "取不到、口径没有写明，或只有标题没有正文核对的内容，写入未知。",
+            "事实保留接口里的原值、日期和来源。单位以同一来源写明的文字为准。"
+            "取不到、口径没有写明，或只有标题没有正文的内容，写入未知。",
         ),
     }
     title, body = lessons[beijing_now(current).isoweekday()]
@@ -602,61 +756,32 @@ def _fetch_etf_pair(http_get: HttpGet, session_date: str) -> dict[str, Any]:
     return result
 
 
-def _fetch_headlines(http_get: HttpGet) -> dict[str, Any]:
-    errors: list[dict[str, str]] = []
-    rows: list[dict[str, str]] = []
-    kuaixun = _safe_call(
-        "东方财富快讯",
-        lambda: parse_kuaixun(
-            http_get(KUAIXUN_URL, _headers("https://kuaixun.eastmoney.com/"), 20).decode("utf-8", "replace")
-        ),
-        errors,
-    )
-    if kuaixun:
-        rows.extend(kuaixun)
-    params = {
-        "client": "web",
-        "biz": "web_news_col",
-        "column": "353",
-        "order": "1",
-        "needInteractData": "0",
-        "page_index": "1",
-        "page_size": "30",
-        "req_trace": "learning-brief",
-        "fields": "showTime,title,mediaName,url",
-        "types": "1,20",
-    }
-    column = _safe_call(
-        "东方财富栏目353",
-        lambda: parse_em_column(
-            _get_json(
-                http_get,
-                EM_COLUMN_URL + "?" + urllib.parse.urlencode(params),
-                _headers("https://kuaixun.eastmoney.com/"),
-            )
-        ),
-        errors,
-    )
-    if column:
-        rows.extend(column)
-    seen = set()
-    matched = []
-    for row in rows:
-        if row["title"] in seen:
-            continue
-        seen.add(row["title"])
-        labels = classify_headline(row["title"])
-        if not labels:
-            continue
-        matched.append({**row, "labels": labels})
-    matched.sort(key=lambda item: item["time"], reverse=True)
-    return {
-        "fetched": len(seen),
-        "matched": matched[:8],
-        "matched_total": len(matched),
-        "unmatched": max(len(seen) - len(matched), 0),
-        "errors": errors,
-    }
+def _decode_html(raw: bytes) -> str:
+    return raw.decode("utf-8", "replace")
+
+
+def accept_official_article(article: Mapping[str, str]) -> bool:
+    blob = str(article.get("title") or "") + str(article.get("text") or "")[:160]
+    return "纪念币" not in blob
+
+
+def _fetch_verified_docs(http_get: HttpGet) -> list[dict[str, str]]:
+    index_raw = http_get(PBC_INDEX_URL, _headers(PBC_ORIGIN + "/"), 20)
+    links = parse_pbc_links(_decode_html(index_raw))
+    docs: list[dict[str, str]] = []
+    for link in links[:6]:
+        if len(docs) >= 2:
+            break
+        article = parse_pbc_article(_decode_html(http_get(link["url"], _headers(PBC_INDEX_URL), 20)), link["url"])
+        if article and accept_official_article(article):
+            docs.append(article)
+    if not docs:
+        raise RuntimeError("没有得到可核对的原始页面正文")
+    return docs
+
+
+def _fetch_unit_phrases(http_get: HttpGet, url: str, referer: str) -> list[str]:
+    return extract_unit_phrases(_decode_html(http_get(url, _headers(referer), 20)))
 
 
 def _key_presence(env: Mapping[str, str]) -> dict[str, bool]:
@@ -711,20 +836,30 @@ def collect_market(
         "older": None,
         "errors": [],
     }
-    headlines = _safe_call("新闻标题", lambda: _fetch_headlines(getter), errors) or {
-        "fetched": 0,
-        "matched": [],
-        "matched_total": 0,
-        "unmatched": 0,
-        "errors": [],
-    }
+    verified_docs = _safe_call("中国人民银行原始页面", lambda: _fetch_verified_docs(getter), errors) or []
+    sse_unit_phrases = _safe_call(
+        "上交所融资页面单位语句",
+        lambda: _fetch_unit_phrases(getter, SSE_MARGIN_PAGE, "https://www.sse.com.cn/"),
+        errors,
+    ) or []
+    em_unit_phrases = _safe_call(
+        "东方财富融资页面单位语句",
+        lambda: _fetch_unit_phrases(getter, EM_MARGIN_PAGE, "https://data.eastmoney.com/"),
+        errors,
+    ) or []
+    if sse_margin:
+        sse_margin = {**sse_margin, "unit_phrases": sse_unit_phrases}
+    if em_margin:
+        em_margin = {**em_margin, "unit_phrases": em_unit_phrases}
     concept_names = [row["name"] for row in concepts.get("top") or []]
     for label, board in (("东方财富行业板块", industries), ("东方财富概念板块", concepts)):
         if board.get("status") != "ok" and board.get("error"):
             errors.append({"source": label, "error": board["error"]})
-    return {
+    payload = {
         "generated_at": format_stamp(current),
         "session_date": session_date,
+        "clock": market_clock(current, session_date),
+        "cache_used": False,
         "llm_called": False,
         "notifications_sent": False,
         "broker_connected": False,
@@ -739,185 +874,143 @@ def collect_market(
         "sse_margin": sse_margin,
         "szse_margin": szse_margin,
         "em_margin": em_margin,
+        "sse_unit_phrases": sse_unit_phrases,
+        "em_unit_phrases": em_unit_phrases,
         "etf": etf,
-        "headlines": headlines,
+        "verified_docs": verified_docs,
         "lesson": concept_for_date(current),
         "errors": errors,
     }
+    payload["completeness"] = assess_completeness(payload)
+    return payload
+
+
+
+def _view(payload: Mapping[str, Any]) -> dict[str, Any]:
+    data = dict(payload)
+    if not data.get("clock"):
+        generated = datetime.strptime(str(data.get("generated_at") or "2026-11-08 21:00:00"), "%Y-%m-%d %H:%M:%S")
+        data["clock"] = market_clock(generated.replace(tzinfo=BJ_TZ), str(data.get("session_date") or ""))
+    data.setdefault("verified_docs", [])
+    data.setdefault("cache_used", False)
+    data.setdefault("sse_unit_phrases", (data.get("sse_margin") or {}).get("unit_phrases") or [])
+    data.setdefault("em_unit_phrases", (data.get("em_margin") or {}).get("unit_phrases") or [])
+    data["completeness"] = assess_completeness(data)
+    return data
 
 
 def _coverage_rows(payload: Mapping[str, Any]) -> list[dict[str, str]]:
-    indices = payload.get("indices") or []
-    turnover_ready = [row for row in indices if row["code"] in TURNOVER_CODES and row.get("amount_unit_checked")]
-    sse = payload.get("sse_margin")
-    szse = payload.get("szse_margin")
-    em_margin = payload.get("em_margin")
-    etf = payload.get("etf") or {}
-    headlines = payload.get("headlines") or {}
-    breadth = payload.get("breadth") or {}
-    limit_up = payload.get("limit_up") or {}
-    limit_down = payload.get("limit_down") or {}
-    concepts = payload.get("concepts") or {}
-    industries = payload.get("industries") or {}
-    persistence = payload.get("persistence") or {}
-    rows = [
-        _coverage(
-            "基本面",
-            "宏观、政策、行业、业绩新变化",
-            "部分" if headlines.get("matched") else "缺失",
-            payload.get("generated_at") or "",
-            "东方财富快讯；东方财富栏目353",
-            "只有标题和关键词归类，没有全文核对，也不能确认这些标题就是新的变化",
-        ),
-        _coverage(
-            "资金面",
-            "上证指数与深证成指成交额",
-            "已取得" if len(turnover_ready) == 2 else "缺失",
-            str(payload.get("session_date") or ""),
-            "新浪财经指数行情",
-            "两只指数成交额相加仍可能不同于交易所公布的全市场股票成交额",
-        ),
-        _coverage(
-            "资金面",
-            "上交所融资余额原值",
-            "已取得" if sse else "缺失",
-            str((sse or {}).get("date") or ""),
-            "query.sse.com.cn queryMargin.do 字段 rzye",
-            "JSON 没有单位字段，折算成亿元放在解释里",
-        ),
-        _coverage(
-            "资金面",
-            "深交所融资余额原值",
-            "已取得" if szse else "缺失",
-            str((szse or {}).get("date") or ""),
-            "www.szse.cn CATALOGID=1837_xxpl 字段 jrrzye",
-            "页脚公式中的元不套用到汇总单元格；单元格自身没有单位字段，本次不换算",
-        ),
-        _coverage(
-            "资金面",
-            "两市融资余额对照",
-            "已取得" if em_margin else "缺失",
-            str((em_margin or {}).get("date") or ""),
-            "东方财富 RPTA_WEB_MARGIN_DAILYTRADE 字段 FIN_BALANCE",
-            "日期常晚于行情日期；页面惯例单位写入解释，不与不同日期的交易所数字相加",
-        ),
-        _coverage(
-            "资金面",
-            "ETF申赎",
-            "部分" if (etf.get("newer") or {}).get("complete") else "缺失",
-            str((etf.get("newer") or {}).get("stat_date") or ""),
-            "上交所 ETF 份额 JSON 字段 TOT_VOL",
-            "只有上交所份额原值及两日差额，没有申赎金额，也没有深市份额",
-        ),
-        _coverage(
-            "情绪面",
-            "涨跌家数",
-            "已取得" if breadth.get("status") == "ok" else "缺失",
-            str(breadth.get("qdate") or ""),
-            "东方财富 getTopicZDFenBu",
-            "按涨跌幅分布桶相加，不是交易所官方家数，也不是精确涨跌停家数",
-        ),
-        _coverage(
-            "情绪面",
-            "涨停与跌停家数",
-            "已取得"
-            if limit_up.get("status") == "ok" and limit_down.get("status") == "ok"
-            else "部分"
-            if limit_up.get("status") == "ok" or limit_down.get("status") == "ok"
-            else "缺失",
-            str(limit_up.get("qdate") or limit_down.get("qdate") or ""),
-            "东方财富涨停池、跌停池字段 tc",
-            "专题池口径可能与按价格自行计算的涨跌停不同；简报不列证券代码",
-        ),
-        _coverage(
-            "情绪面",
-            "行业与概念涨跌榜",
-            "已取得" if industries.get("status") == "ok" and concepts.get("status") == "ok" else "部分" if industries.get("status") == "ok" or concepts.get("status") == "ok" else "缺失",
-            str(payload.get("session_date") or ""),
-            "东方财富板块列表",
-            "这是价格涨跌幅，不是行业基本面变化",
-        ),
-        _coverage(
-            "情绪面",
-            "热点持续性",
-            "已比较" if persistence.get("status") == "compared" else "缺失",
-            str(payload.get("session_date") or ""),
-            "本目录上一份 hot_concepts_state.json",
-            "没有上一交易日的同口径名单时，持续性保持未知；一次名称重合也不能证明热点持续",
-        ),
-        _coverage(
-            "解释",
-            "LLM 市场综述",
-            "阻塞",
-            payload.get("generated_at") or "",
-            "未调用模型",
-            "没有可用且已获准使用的 LLM API 密钥；订阅本身不提供本次调用",
-        ),
+    data = _view(payload)
+    indices = data.get("indices") or []
+    core = [row for row in indices if row.get("code") in TURNOVER_CODES]
+    sse = data.get("sse_margin")
+    szse = data.get("szse_margin")
+    em_margin = data.get("em_margin")
+    etf = data.get("etf") or {}
+    docs = data.get("verified_docs") or []
+    breadth = data.get("breadth") or {}
+    limit_up = data.get("limit_up") or {}
+    limit_down = data.get("limit_down") or {}
+    industries = data.get("industries") or {}
+    concepts = data.get("concepts") or {}
+    persistence = data.get("persistence") or {}
+    clock = data.get("clock") or {}
+    completeness = data.get("completeness") or {}
+    return [
+        _coverage("基本面", "原始公告正文", "已核对" if docs else "缺失", "、".join(item.get("published") or "无日期" for item in docs) or "无日期", "中国人民银行页面正文", "未打开正文的标题不进入基本面"),
+        _coverage("资金面", "上证与深证成交额原值", "已取得" if len(core) == 2 else "缺失", str(data.get("session_date") or "无日期"), "新浪财经行情字段", "响应没有单位说明，不换算，也不把两个字段的比值当作单位"),
+        _coverage("资金面", "上交所融资余额原值", "已取得" if sse else "缺失", str((sse or {}).get("date") or "无日期"), "queryMargin.do 字段 rzye", "只有页面语句同时写明融资余额和单位时才采用该单位"),
+        _coverage("资金面", "深交所融资余额原值", "已取得" if szse else "缺失", str((szse or {}).get("date") or "无日期"), "深交所汇总字段 jrrzye", "页脚公式中的单位不套到汇总单元格"),
+        _coverage("资金面", "东方财富融资对照原值", "已取得" if em_margin else "缺失", str((em_margin or {}).get("date") or "无日期"), "RPTA_WEB_MARGIN_DAILYTRADE 字段 FIN_BALANCE", "页面没有同时写明该字段和单位时不换算"),
+        _coverage("资金面", "上交所ETF份额原值差额", "部分" if (etf.get("newer") or {}).get("complete") else "缺失", str((etf.get("newer") or {}).get("stat_date") or "无日期"), "上交所 TOT_VOL", "差额不是金额；没有深市份额"),
+        _coverage("情绪面", "涨跌家数", "已取得" if breadth.get("status") == "ok" else "缺失", str(breadth.get("qdate") or "无日期"), "东方财富涨跌幅分布", "分布桶相加，不是涨跌停家数"),
+        _coverage("情绪面", "涨停与跌停家数", "已取得" if limit_up.get("status") == "ok" and limit_down.get("status") == "ok" else "部分" if limit_up.get("status") == "ok" or limit_down.get("status") == "ok" else "缺失", str(limit_up.get("qdate") or limit_down.get("qdate") or "无日期"), "东方财富涨停池和跌停池字段 tc", "不列证券代码"),
+        _coverage("情绪面", "行业与概念涨跌榜", "已取得" if industries.get("status") == "ok" and concepts.get("status") == "ok" else "部分" if industries.get("status") == "ok" or concepts.get("status") == "ok" else "缺失", str(data.get("session_date") or "无日期"), "东方财富板块列表", "价格涨跌幅，不是业绩或政策"),
+        _coverage("情绪面", "热点持续性", "已比较" if persistence.get("status") == "compared" else "缺失", str(data.get("session_date") or "无日期"), "上一份概念名称", "没有上一交易日名单时保持未知"),
+        _coverage("日期", "生成日与行情日", "一致" if clock.get("quote_is_generation_date") else "不一致", f"{clock.get('generated_date') or '无日期'} / {clock.get('quote_date') or '无日期'}", "本机北京时间与行情字段", clock.get("phase") or "无时段"),
+        _coverage("完整性", "当日完整简报", "通过" if completeness.get("complete") else "未通过", str(data.get("generated_at") or "无日期"), "本次现场请求", "；".join(completeness.get("reasons") or []) or "无"),
+        _coverage("解释", "模型综述", "未知", str(data.get("generated_at") or "无日期"), "未调用模型", "没有使用 LLM API 密钥"),
     ]
-    return rows
 
 
 def _coverage(dimension: str, metric: str, status: str, as_of: str, source: str, gap: str) -> dict[str, str]:
-    return {
-        "dimension": dimension,
-        "metric": metric,
-        "status": status,
-        "as_of": as_of or "无日期",
-        "source": source,
-        "gap": gap,
-    }
+    return {"dimension": dimension, "metric": metric, "status": status, "as_of": as_of or "无日期", "source": source, "gap": gap}
+
+
+def _prepare(payload: Mapping[str, Any]) -> dict[str, Any]:
+    return _view(payload)
 
 
 def render_brief(payload: Mapping[str, Any]) -> str:
-    lines: list[str] = [
-        "# A股全市场学习简报",
+    data = _prepare(payload)
+    clock = data["clock"]
+    completeness = data["completeness"]
+    lines = [
+        "# A股学习简报",
         "",
-        f"- 生成时间：{payload.get('generated_at')}（北京时间，UTC+8）",
-        f"- 指数行情日期：{payload.get('session_date') or '未知'}",
-        "- 范围：全市场学习材料。证券涨跌榜只作为市场现象的计数和名称，不写买卖建议。",
-        "- 模型：本次 llm_called=false。上游大盘复盘的模型综述没有运行。",
-        "- 通知：本次 notifications_sent=false。钉钉、企业微信、飞书、Telegram、邮件、Webhook 都没有发送。",
-        "- 交易：本次 broker_connected=false。没有券商登录、下单或持仓修改。",
+        f"- 生成时间：{data.get('generated_at')}（北京时间）",
+        f"- 指数行情日期：{data.get('session_date') or '未知'}",
+        f"- 时段：{clock.get('phase')}",
+        "- 状态：完整简报" if completeness.get("complete") else "- 状态：不是完整简报。原因：" + "；".join(completeness.get("reasons") or ["资料不足"]),
+        "- 来源：本次现场请求。没有把上一份简报中的数字写进来。",
+        "- 模型综述：未知。本次没有调用 LLM。",
         "",
         "## 1. 事实",
         "",
-        "### 1.1 基本面线索",
-        "",
-        "下面是标题命中宏观、政策、行业或业绩关键词的公开条目。命中只表示标题里有这些词。",
+        "### 1.1 基本面",
         "",
     ]
-    headlines = payload.get("headlines") or {}
-    matched = headlines.get("matched") or []
-    if matched:
-        lines.append(
-            f"本次读到 {headlines.get('fetched', 0)} 条去重标题，"
-            f"其中 {headlines.get('matched_total', len(matched))} 条命中关键词，这里列出时间最新的 {len(matched)} 条。"
-        )
+    docs = data.get("verified_docs") or []
+    if docs:
+        lines.append(f"下面 {len(docs)} 份材料来自已打开的原始页面正文，不是按标题关键词挑选的新闻列表。")
         lines.append("")
-        for index, item in enumerate(matched, start=1):
-            labels = "、".join(item.get("labels") or [])
-            lines.append(
-                f"{index}. [{labels}] {item.get('time') or '时间未知'} {item.get('source')}：{item.get('title')}"
-            )
-            if item.get("url"):
-                lines.append(f"   链接：{item['url']}")
+        for index, item in enumerate(docs, start=1):
+            lines.append(f"{index}. {item.get('source')}，发布时间 {item.get('published') or '未知'}：{item.get('title')}")
+            lines.append(f"   链接：{item.get('url')}")
+            body = str(item.get("text") or "")
+            excerpt = body[:180] + ("……（其余正文见 latest.evidence.md）" if len(body) > 180 else "")
+            lines.append(f"   正文摘录：{excerpt}")
+            lines.append("")
     else:
-        lines.append("本次没有取得可归类的标题。")
-    lines.extend(["", "### 1.2 资金面", ""])
-    lines.extend(_render_indices(payload.get("indices") or []))
-    lines.extend(_render_margin(payload))
-    lines.extend(_render_etf(payload.get("etf") or {}))
-    lines.extend(["", "### 1.3 情绪面", ""])
-    lines.extend(_render_breadth(payload.get("breadth") or {}))
-    lines.extend(_render_limits(payload.get("limit_up") or {}, payload.get("limit_down") or {}))
-    lines.extend(_render_boards("行业涨跌幅前 5 名和后 5 名", payload.get("industries") or {}))
-    lines.extend(_render_boards("概念涨跌幅前 5 名和后 5 名", payload.get("concepts") or {}))
-    lines.extend(_render_persistence(payload.get("persistence") or {}))
+        lines.append("本次没有打开可核对的原始公告正文。基本面保持未知。")
+        lines.append("")
+    lines.extend(_render_price_facts(data))
+    lines.extend(_render_margin_facts(data))
+    lines.extend(_render_etf_facts(data.get("etf") or {}))
+    lines.extend(_render_sentiment_facts(data))
     lines.extend(["", "## 2. 解释", ""])
-    lines.extend(_render_explanations(payload))
-    lines.extend(["", "## 3. 未知", ""])
-    lines.extend(_render_unknowns(payload))
-    lesson = payload.get("lesson") or {}
+    lines.extend(
+        [
+            "指数点位和涨跌来自新浪行情里的价格字段。成交额只保留原值，因为这次响应没有写出单位。",
+            "融资余额按各自日期并列。日期不同的数字不相加。",
+            "涨跌家数是分布桶里的计数相加。涨停和跌停以专题池的 tc 为准。",
+            "行业和概念涨跌幅是价格变动。它们不说明业绩或政策。",
+            "热点名称重合只比较榜单名称。",
+            "",
+            "## 3. 未知",
+            "",
+        ]
+    )
+    for item in data.get("errors") or []:
+        lines.append(f"- {item['source']}：{item['error']}")
+    for item in (data.get("etf") or {}).get("errors") or []:
+        lines.append(f"- 上交所ETF份额字段：{item}")
+    lines.extend(
+        [
+            "- 成交额、融资余额和 ETF 份额原值在没有对应单位原文时，都不换算。",
+            "- 交易所公布的全市场股票成交额、深市 ETF 份额，以及带货币单位的申购或赎回数据，本次没有取得。",
+            "- 主力资金流没有采集。",
+            "- 热点是否持续：没有同口径多日样本时保持未知。",
+            "- 模型综述保持未知。",
+        ]
+    )
+    presence = data.get("key_presence") or {}
+    configured = [name for name, present in presence.items() if present]
+    if configured:
+        lines.append("- 环境中有非空凭证变量。本程序没有读取变量值，也没有用它们发起调用：" + "、".join(configured) + "。")
+    else:
+        lines.append("- 检查过的 LLM、行情令牌和通知凭证变量都是空的。")
+    lesson = data.get("lesson") or {}
     lines.extend(
         [
             "",
@@ -925,188 +1018,135 @@ def render_brief(payload: Mapping[str, Any]) -> str:
             "",
             f"概念：{lesson.get('title') or '未知'}",
             "",
-            "这一节是固定教材说明，用来解释字段，不新增行情数字。",
+            "这一节只解释字段，不新增行情数字。",
             "",
             lesson.get("body") or "",
             "",
-            "## 5. 覆盖矩阵",
+            "## 5. 已有 16:30 任务如何读取",
             "",
-            "| 维度 | 指标 | 状态 | 日期 | 来源 | 缺口 |",
-            "| --- | --- | --- | --- | --- | --- |",
-        ]
-    )
-    for row in _coverage_rows(payload):
-        lines.append(
-            "| {dimension} | {metric} | {status} | {as_of} | {source} | {gap} |".format(**row)
-        )
-    lines.extend(
-        [
-            "",
-            "## 6. 已有 16:30 任务如何读取",
-            "",
-            "工作日 16:30（北京时间）的简报消息已经由现有 Grok Bot 任务发送。本程序不创建第二个定时任务，也不调用通知接口。",
-            "该任务应读取持续运行目录中的 `latest.md`，只转述文件里的事实、解释和未知。文件不存在或日期不是当次运行时，消息应写明没有新简报，并由任务停止补写数字。",
+            "工作日 16:30（北京时间）的任务保持不变。它读取同一次运行写出的 `latest.md`。",
+            "文件写明「不是完整简报」或「本次没有形成简报」时，消息只转述这个状态，不用上一份文件补数字。",
             "",
         ]
     )
     return "\n".join(lines).rstrip() + "\n"
 
 
-def _render_indices(indices: list[dict[str, Any]]) -> list[str]:
+def _render_price_facts(data: Mapping[str, Any]) -> list[str]:
+    lines = ["### 1.2 资金面", ""]
+    indices = [row for row in data.get("indices") or [] if row.get("code") in TURNOVER_CODES]
     if not indices:
-        return ["指数行情本次没有取到。", ""]
-    lines = [
-        "新浪财经同一次响应里的完整指数行情。成交额使用响应中的第 10 个字段（从 1 开始计数，程序下标 9）。",
-        "",
-        "| 指数 | 代码 | 行情日期 | 行情时间 | 点位 | 涨跌点 | 涨跌幅 | 成交额原值 | 简要行情成交额原值 | 二者比值 |",
-        "| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |",
-    ]
+        lines.append("上证指数和深证成指本次没有取到。")
+        lines.append("")
+        return lines
     for row in indices:
-        ratio = "无" if row.get("amount_ratio") is None else _decimal(row["amount_ratio"], 2)
-        summary = "无" if row.get("amount_summary") is None else str(int(round(row["amount_summary"])))
         lines.append(
-            "| {name} | {code} | {quote_date} | {quote_time} | {current} | {change} | {pct}% | {amount} | {summary} | {ratio} |".format(
-                name=row["name"],
-                code=row["code"],
-                quote_date=row.get("quote_date") or "",
-                quote_time=row.get("quote_time") or "",
-                current=_decimal(row["current"], 2),
-                change=_signed(row["change"], 2),
-                pct=_signed(row["change_pct"], 2),
-                amount=str(int(round(row["amount_yuan"]))),
-                summary=summary,
-                ratio=ratio,
-            )
+            f"{row['name']} { _decimal(row['current'], 2) } 点，涨跌 {_signed(row['change'], 2)} 点，"
+            f"涨跌幅 {_signed(row['change_pct'], 2)}%。行情时间 {row.get('quote_date')} {row.get('quote_time')}。"
         )
-    checked = [row for row in indices if row["code"] in TURNOVER_CODES and row.get("amount_unit_checked")]
+        lines.append(
+            f"成交额字段原值 {int(round(row['amount_field']))}。来源没有写出这个字段的单位，本次不换算。"
+        )
+    lines.append("上证与深证的成交额原值不相加，也不换算。")
     lines.append("")
-    if len(checked) == 2:
-        total = sum(row["amount_yuan"] for row in checked)
-        lines.append(
-            f"上证指数与深证成指成交额原值合计：{int(round(total))}。"
-            "创业板指、沪深300、科创50、上证50没有加入合计，避免把包含关系里的成交额重复相加。"
-        )
-    else:
-        lines.append("上证指数与深证成指的成交额原值没有同时通过简要行情比值核对，本次不写合计。")
-    unchecked = [row["name"] for row in indices if not row.get("amount_unit_checked")]
-    if unchecked:
-        lines.append(
-            "比值不在 9000 到 11000 的指数，本次不判断成交额单位："
-            + "、".join(unchecked)
-            + "。"
-        )
     return lines
 
 
-def _render_margin(payload: Mapping[str, Any]) -> list[str]:
-    lines = ["", "融资余额按来源分开列出，不同日期的数字不相加。"]
-    sse = payload.get("sse_margin")
+def _render_margin_facts(data: Mapping[str, Any]) -> list[str]:
+    lines = []
+    sse = data.get("sse_margin")
     if sse:
-        lines.append(
-            f"上交所汇总：信用交易日期 {sse['date']}，字段 rzye={sse['rzye']}"
-            + (f"，字段 rzmre={sse['rzmre']}" if sse.get("rzmre") is not None else "")
-            + "。来源：https://query.sse.com.cn/marketdata/tradedata/queryMargin.do"
-        )
+        phrase = unit_phrase_for(data.get("sse_unit_phrases") or [], "融资余额")
+        lines.append(f"上交所融资余额：日期 {sse['date']}，字段 rzye={sse['rzye']}。")
+        if phrase:
+            lines.append(f"页面单位原文：{phrase}")
+        else:
+            lines.append("页面单位语句没有同时写明融资余额。rzye 的单位未知，不换算。")
     else:
         lines.append("上交所融资余额本次没有取到。")
-    szse = payload.get("szse_margin")
+    szse = data.get("szse_margin")
     if szse:
         attempted = "、".join(szse.get("attempted_dates") or [])
         lines.append(
-            f"深交所汇总：本次取到数据的查询日期 {szse['date']}，字段 jrrzye={szse['balance_raw']}，字段 jrrzmr={szse['buy_raw']}。"
-            + (f"从行情日向前尝试的日期：{attempted}。" if attempted else "")
-            + "来源：https://www.szse.cn/api/report/ShowReport/data?CATALOGID=1837_xxpl"
+            f"深交所融资余额：查询日期 {szse['date']}，字段 jrrzye={szse['balance_raw']}。"
+            + (f"尝试日期：{attempted}。" if attempted else "")
         )
-        if szse.get("footer"):
-            lines.append(f"深交所本次响应页脚：{szse['footer']}")
-        lines.append("汇总单元格没有单独的单位字段。页脚里的“元”写在勾稽公式中，本次不把该公式单位套到 jrrzye 的数字上，也不做亿元换算。")
+        lines.append("不把该公式单位套到 jrrzye。汇总单元格的单位未知，不换算。")
     else:
         lines.append("深交所融资余额本次没有取到。")
-    em_margin = payload.get("em_margin")
+    em_margin = data.get("em_margin")
     if em_margin:
-        buy = f"，字段 FIN_BUY_AMT={_decimal(em_margin['fin_buy'], 2)}" if em_margin.get("fin_buy") is not None else ""
-        lines.append(
-            f"东方财富两融日报：统计日期 {em_margin['date']}，字段 FIN_BALANCE={_decimal(em_margin['fin_balance'], 2)}{buy}。"
-            "来源：https://datacenter-web.eastmoney.com/api/data/v1/get?reportName=RPTA_WEB_MARGIN_DAILYTRADE"
-        )
+        phrase = unit_phrase_for(data.get("em_unit_phrases") or [], "融资余额")
+        lines.append(f"东方财富融资对照：日期 {em_margin['date']}，字段 FIN_BALANCE={_decimal(em_margin['fin_balance'], 2)}。")
+        if phrase:
+            lines.append(f"页面单位原文：{phrase}")
+        else:
+            lines.append("页面没有同时写明 FIN_BALANCE 的单位。这个原值不换算。")
     else:
-        lines.append("东方财富融资余额对照本次没有取到。")
+        lines.append("东方财富融资对照本次没有取到。")
+    lines.append("")
     return lines
 
 
-def _render_etf(etf: Mapping[str, Any]) -> list[str]:
-    lines = ["", "ETF 只记录上交所份额字段原值，不记录单只基金名称。"]
+def _render_etf_facts(etf: Mapping[str, Any]) -> list[str]:
     newer = etf.get("newer")
     older = etf.get("older")
     if not newer:
-        lines.append("上交所 ETF 份额本次没有取到。")
-        return lines
-    lines.append(
-        f"较新统计日 {newer.get('stat_date')}：TOT_VOL 原值合计 {_decimal(newer.get('sum_raw') or 0, 2)}，"
-        f"返回 {newer.get('rows')} 行，接口 total={newer.get('reported_total')}，"
-        f"行数与 total {'一致' if newer.get('complete') else '不一致'}。"
-    )
-    if older:
+        return ["上交所 ETF 份额原值本次没有取到。", ""]
+    lines = [
+        f"上交所 TOT_VOL 原值合计：{newer.get('stat_date')} 为 {_decimal(float(newer.get('sum_raw') or 0), 2)}，"
+        f"共 {newer.get('rows')} 行，接口 total={newer.get('reported_total')}。"
+    ]
+    if older and newer.get("complete") and older.get("complete"):
+        delta = float(newer["sum_raw"]) - float(older["sum_raw"])
         lines.append(
-            f"较早统计日 {older.get('stat_date')}：TOT_VOL 原值合计 {_decimal(older.get('sum_raw') or 0, 2)}，"
-            f"返回 {older.get('rows')} 行，接口 total={older.get('reported_total')}，"
-            f"行数与 total {'一致' if older.get('complete') else '不一致'}。"
+            f"{older.get('stat_date')} 的原值合计为 {_decimal(float(older.get('sum_raw') or 0), 2)}。"
+            f"两日原值差额 {_signed(delta, 2)}。JSON 没有单位。这个差额不能换成金额。"
         )
-        if newer.get("complete") and older.get("complete"):
-            delta = float(newer["sum_raw"]) - float(older["sum_raw"])
-            lines.append(f"两日 TOT_VOL 原值合计差额：{_signed(delta, 2)}。")
     else:
-        lines.append("没有取到第二个统计日，本次不计算份额差额。")
-    lines.append("来源：https://query.sse.com.cn/commonQuery.do?sqlId=COMMON_SSE_ZQPZ_ETFZL_XXPL_ETFGM_SEARCH_L")
+        lines.append("没有两个完整统计日，本次不计算原值差额。")
+    lines.append("")
     return lines
 
 
-def _render_breadth(breadth: Mapping[str, Any]) -> list[str]:
-    if breadth.get("status") != "ok":
-        return ["涨跌家数本次没有取到。"]
-    return [
-        (
-            f"东方财富涨跌幅分布：分布日期 {breadth.get('qdate')}，"
-            f"上涨 {breadth.get('up')} 家，下跌 {breadth.get('down')} 家，平盘 {breadth.get('flat')} 家，"
-            f"分布合计 {breadth.get('total')} 家。"
-        ),
-        "来源：https://push2ex.eastmoney.com/getTopicZDFenBu",
-    ]
-
-
-def _render_limits(limit_up: Mapping[str, Any], limit_down: Mapping[str, Any]) -> list[str]:
-    lines = [""]
-    if limit_up.get("status") == "ok":
+def _render_sentiment_facts(data: Mapping[str, Any]) -> list[str]:
+    lines = ["### 1.3 情绪面", ""]
+    breadth = data.get("breadth") or {}
+    if breadth.get("status") == "ok":
         lines.append(
-            f"东方财富涨停池：日期 {limit_up.get('qdate')}，字段 tc={limit_up.get('count')}，"
-            f"本次返回 {limit_up.get('returned')} 条。"
+            f"涨跌分布日期 {breadth.get('qdate')}：上涨 {breadth.get('up')} 家，下跌 {breadth.get('down')} 家，"
+            f"平盘 {breadth.get('flat')} 家，合计 {breadth.get('total')} 家。"
         )
-        industries = limit_up.get("industries") or []
-        if industries and limit_up.get("complete"):
-            text = "、".join(f"{item['name']} {item['count']} 只" for item in industries)
-            lines.append(f"涨停池返回记录中的行业出现次数前 5 名：{text}。")
-        elif industries:
-            lines.append("涨停池只返回了部分记录，本次不统计行业出现次数。")
+    else:
+        lines.append("涨跌家数本次没有取到。")
+    limit_up = data.get("limit_up") or {}
+    limit_down = data.get("limit_down") or {}
+    if limit_up.get("status") == "ok":
+        lines.append(f"涨停池日期 {limit_up.get('qdate')}，字段 tc={limit_up.get('count')}。")
+        if limit_up.get("complete") and limit_up.get("industries"):
+            text = "、".join(f"{item['name']} {item['count']} 只" for item in limit_up["industries"][:3])
+            lines.append(f"涨停池行业出现次数前 3 名：{text}。")
     else:
         lines.append("涨停家数本次没有取到。")
     if limit_down.get("status") == "ok":
-        lines.append(
-            f"东方财富跌停池：日期 {limit_down.get('qdate')}，字段 tc={limit_down.get('count')}。"
-        )
+        lines.append(f"跌停池日期 {limit_down.get('qdate')}，字段 tc={limit_down.get('count')}。")
     else:
         lines.append("跌停家数本次没有取到。")
-    lines.append("涨停池和跌停池的来源页面属于东方财富专题，简报不写其中的证券代码。")
-    return lines
-
-
-def _render_boards(title: str, board: Mapping[str, Any]) -> list[str]:
-    lines = ["", title + "："]
-    if board.get("status") != "ok":
-        lines.append("本次没有取到。")
-        return lines
-    lines.append("涨幅前列：" + _board_text(board.get("top") or []))
-    lines.append("跌幅前列：" + _board_text(board.get("bottom") or []))
-    lines.append(f"来源主机：{board.get('host') or '东方财富板块列表'}")
+    lines.append("涨停池和跌停池不列证券代码。")
+    for title, board in (("行业", data.get("industries") or {}), ("概念", data.get("concepts") or {})):
+        if board.get("status") == "ok":
+            lines.append(f"{title}涨幅前 3 名：" + _board_text((board.get("top") or [])[:3]))
+            lines.append(f"{title}跌幅前 3 名：" + _board_text((board.get("bottom") or [])[:3]))
+        else:
+            lines.append(f"{title}涨跌榜本次没有取到。")
+    persistence = data.get("persistence") or {}
+    if persistence.get("status") == "compared":
+        overlap = persistence.get("overlap") or []
+        lines.append(f"与上一份概念名称相比，重合 {len(overlap)} 个。这只是名称比较。")
+    elif persistence.get("status") == "same_session":
+        lines.append("上一份概念名称与本次行情日期相同，不作为新的持续性证据。")
+    else:
+        lines.append("没有可比较的上一交易日概念榜，不判断热点是否持续。")
     return lines
 
 
@@ -1116,77 +1156,25 @@ def _board_text(rows: list[dict[str, Any]]) -> str:
     return "、".join(f"{row['name']} {_signed(row['change_pct'], 2)}%" for row in rows)
 
 
-def _render_persistence(persistence: Mapping[str, Any]) -> list[str]:
-    status = persistence.get("status")
-    lines = ["", "热点持续性："]
-    if status == "compared":
-        overlap = persistence.get("overlap") or []
+def render_evidence(payload: Mapping[str, Any]) -> str:
+    data = _prepare(payload)
+    lines = ["# 证据", "", "本文件保留原值和链接。阅读用简报见 latest.md。", ""]
+    for row in data.get("indices") or []:
         lines.append(
-            f"上一份概念涨幅前 5 名的行情日期是 {persistence.get('previous_date')}，"
-            f"与本次前 5 名重合 {len(overlap)} 个"
-            + (f"：{'、'.join(overlap)}。" if overlap else "。")
+            f"- {row.get('name')} {row.get('code')} {row.get('quote_date')} {row.get('quote_time')} "
+            f"点位 {row.get('current')} 成交额字段 {int(round(row.get('amount_field') or 0))} "
+            f"另一字段 {row.get('amount_summary')}"
         )
-    elif status == "same_session":
-        lines.append("上一份状态与本次指数行情日期相同，本次不把重复运行写成新的持续性证据。")
-    else:
-        lines.append("没有可比较的上一交易日概念榜，本次不判断热点是否持续。")
-    return lines
-
-
-def _render_explanations(payload: Mapping[str, Any]) -> list[str]:
-    lines = [
-        "成交额字段：完整行情第 10 个字段与简要行情成交额字段的比值约等于 10000 时，"
-        "前者按元、后者按万元记录。亿元换算是原值除以 100000000，只在比值核对通过后作为阅读单位。",
-        "涨跌家数把分布接口中的正桶、负桶和 0 桶分别相加。接近 10% 或 20% 的桶仍是分布计数，不替代涨停池字段 tc。",
-        "融资余额的交易所日期可以晚于指数行情日期。日期不同的上交所、深交所和东方财富数字保持并列。",
-        "上交所 rzye 的 JSON 没有单位。公开汇总页长期把同类合计显示为元；按这个惯例，亿元等于 rzye 除以 100000000。这个换算写在解释中。",
-        "深交所页脚用“元”描述余额勾稽公式。汇总行 jrrzye 仍是页面上的另一个数字，JSON 没有给出它自己的单位，所以保持原文字，不换成元或亿元。",
-        "东方财富 FIN_BALANCE 沿用该数据中心页面的亿元展示惯例。它是对照值，不覆盖交易所原值。",
-        "ETF 的 TOT_VOL 差额使用两日原值合计相减。AkShare 的 fund_etf_scale_sse 会把该字段乘以 10000 后称为份；"
-        "本次 JSON 没有单位字段，所以“万份”只作为这条第三方处理的解释。差额的正负只表示份额合计升降。",
-        "主力资金净流入不进入本简报的资金口径。板块涨跌幅也不解释成行业业绩或政策变化。",
-        "标题关键词由固定词表归类，用来找线索。它不判断消息真假，也不判断影响大小。",
-    ]
-    checked = [row for row in payload.get("indices") or [] if row["code"] in TURNOVER_CODES and row.get("amount_unit_checked")]
-    if len(checked) == 2:
-        total_yi = sum(row["amount_yuan"] for row in checked) / 100000000
-        lines.insert(1, f"按上述核对，本次上证指数与深证成指成交额合计可阅读为 {_decimal(total_yi, 2)} 亿元。")
-    sse = payload.get("sse_margin")
-    if sse:
-        lines.insert(
-            4,
-            f"按元惯例，上交所 {sse['date']} 的 rzye 可阅读为 {_decimal(sse['rzye'] / 100000000, 2)} 亿元。",
-        )
-    return lines
-
-
-def _render_unknowns(payload: Mapping[str, Any]) -> list[str]:
-    lines = []
-    for item in payload.get("errors") or []:
-        lines.append(f"- {item['source']}：{item['error']}")
-    headlines = payload.get("headlines") or {}
-    for item in headlines.get("errors") or []:
-        lines.append(f"- {item['source']}：{item['error']}")
-    etf_errors = (payload.get("etf") or {}).get("errors") or []
-    for item in etf_errors:
-        lines.append(f"- 上交所ETF份额尝试：{item}")
-    lines.extend(
-        [
-            "- 交易所官方全市场股票成交额：本次没有单独取得，指数成交额合计不能自动替代它。",
-            "- 深市 ETF 份额和全市场申购赎回金额：本次没有取得。",
-            "- 主力资金完整资金流：本次没有采集，也不用估算值填空。",
-            "- 宏观、政策和业绩的正文、发布时间和原始文件页码：本次只有新闻标题。",
-            "- 热点是否持续：没有同口径多日样本时保持未知；有一次名称重合也只是名单比较。",
-            "- 模型对三面材料的综述：没有调用 LLM API。Google AI Pro 订阅没有被当作 API 密钥。",
-        ]
-    )
-    presence = payload.get("key_presence") or {}
-    configured = [name for name, present in presence.items() if present]
-    if configured:
-        lines.append("- 环境里存在非空凭证变量，本程序没有读取变量值，也没有用它们发起调用：" + "、".join(configured) + "。")
-    else:
-        lines.append("- 检查的 LLM、行情令牌和通知凭证变量均为空。")
-    return lines
+    sse_phrases = data.get("sse_unit_phrases") or []
+    em_phrases = data.get("em_unit_phrases") or []
+    lines.append("- 上交所页面单位语句：" + ("；".join(sse_phrases) if sse_phrases else "没有检索到"))
+    lines.append("- 东方财富页面单位语句：" + ("；".join(em_phrases) if em_phrases else "没有检索到"))
+    szse = data.get("szse_margin") or {}
+    if szse.get("footer"):
+        lines.append("- 深交所页脚：" + szse["footer"])
+    for item in data.get("verified_docs") or []:
+        lines.append(f"- 公告 {item.get('published')} {item.get('title')} {item.get('url')}")
+    return "\n".join(lines).rstrip() + "\n"
 
 
 def load_state(path: str) -> dict[str, Any] | None:
@@ -1200,40 +1188,38 @@ def load_state(path: str) -> dict[str, Any] | None:
     return payload if isinstance(payload, dict) else None
 
 
+def _atomic_write(path: str, content: str) -> None:
+    temporary = path + ".tmp"
+    with open(temporary, "w", encoding="utf-8") as handle:
+        handle.write(content)
+    os.replace(temporary, path)
+
+
 def write_brief(output_dir: str, http_get: HttpGet | None = None, env: Mapping[str, str] | None = None) -> dict[str, str]:
     os.makedirs(output_dir, exist_ok=True)
     state_path = os.path.join(output_dir, "hot_concepts_state.json")
     previous = load_state(state_path)
     payload = collect_market(http_get=http_get, previous_state=previous, env=env)
     markdown = render_brief(payload)
+    if not payload.get("indices"):
+        markdown = "# A股学习简报\n\n本次没有形成简报。指数行情没有取到，文件中不沿用上一份简报的数字。\n\n" + markdown
     generated_day = str(payload["generated_at"])[:10]
-    dated_path = os.path.join(output_dir, generated_day + ".md")
     latest_path = os.path.join(output_dir, "latest.md")
+    _atomic_write(os.path.join(output_dir, generated_day + ".md"), markdown)
+    _atomic_write(latest_path, markdown)
+    _atomic_write(os.path.join(output_dir, "latest.evidence.md"), render_evidence(payload))
     coverage_path = os.path.join(output_dir, "latest.coverage.json")
-    for path in (dated_path, latest_path):
-        with open(path, "w", encoding="utf-8") as handle:
-            handle.write(markdown)
-    coverage = _coverage_rows(payload)
-    with open(coverage_path, "w", encoding="utf-8") as handle:
-        json.dump({"generated_at": payload["generated_at"], "rows": coverage}, handle, ensure_ascii=False, indent=2)
-        handle.write("\n")
+    _atomic_write(coverage_path, json.dumps({"generated_at": payload["generated_at"], "complete": payload["completeness"]["complete"], "rows": _coverage_rows(payload)}, ensure_ascii=False, indent=2) + "\n")
     names = [row["name"] for row in (payload.get("concepts") or {}).get("top") or []]
-    if names and payload.get("session_date"):
-        with open(state_path, "w", encoding="utf-8") as handle:
-            json.dump(
-                {
-                    "concept_date": payload["session_date"],
-                    "names": names,
-                    "saved_at": payload["generated_at"],
-                },
-                handle,
-                ensure_ascii=False,
-                indent=2,
-            )
-            handle.write("\n")
-    status = "written" if payload.get("indices") else "written_without_quotes"
+    if names and payload.get("session_date") and payload.get("indices"):
+        _atomic_write(
+            state_path,
+            json.dumps({"concept_date": payload["session_date"], "names": names, "saved_at": payload["generated_at"]}, ensure_ascii=False, indent=2) + "\n",
+        )
+    status = "written_failed" if not payload.get("indices") else "written_complete" if payload["completeness"]["complete"] else "written_partial"
     return {
         "status": status,
+        "complete": "true" if payload["completeness"]["complete"] else "false",
         "markdown": latest_path,
         "coverage": coverage_path,
     }
